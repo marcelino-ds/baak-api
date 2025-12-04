@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -23,10 +23,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Initialize the random number generator with a unique seed
+// Initialize cookie jar on package import
 func init() {
-	rand.Seed(time.Now().UnixNano())
-
 	// Initialize cookie jar for session persistence
 	jar, err := cookiejar.New(&cookiejar.Options{
 		PublicSuffixList: publicsuffix.List,
@@ -108,7 +106,7 @@ var acceptLanguages = []string{
 // Simulate human-like delays
 func humanDelay() {
 	// Random delay between 1-3 seconds to simulate human interaction
-	delay := 1000 + rand.Intn(2000)
+	delay := 1000 + rand.IntN(2000)
 	time.Sleep(time.Duration(delay) * time.Millisecond)
 }
 
@@ -279,7 +277,7 @@ func FetchDocumentWithRetry(url string, referrer string, maxRetries int) (*goque
 	// Use a default referrer if none provided
 	if referrer == "" {
 		if len(visitedPages) > 0 {
-			referrer = visitedPages[rand.Intn(len(visitedPages))]
+			referrer = visitedPages[rand.IntN(len(visitedPages))]
 		} else {
 			referrer = BaseURL
 		}
@@ -310,8 +308,8 @@ func FetchDocumentWithRetry(url string, referrer string, maxRetries int) (*goque
 		}
 
 		// Randomize User-Agent and other headers
-		userAgent := userAgents[rand.Intn(len(userAgents))]
-		acceptLang := acceptLanguages[rand.Intn(len(acceptLanguages))]
+		userAgent := userAgents[rand.IntN(len(userAgents))]
+		acceptLang := acceptLanguages[rand.IntN(len(acceptLanguages))]
 
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
@@ -343,7 +341,7 @@ func FetchDocumentWithRetry(url string, referrer string, maxRetries int) (*goque
 			if res.StatusCode == http.StatusForbidden {
 				lastErr = fmt.Errorf("access forbidden (403): the server might be restricting access or detecting automated requests")
 				// For 403 errors, use a longer backoff with random jitter
-				jitter := float64(1.0 + (rand.Float64() * 0.5)) // 1.0-1.5 jitter factor
+				jitter := 1.0 + (rand.Float64() * 0.5) // 1.0-1.5 jitter factor
 				backoffTime := time.Duration(float64(initialBackoff*3) * (backoffFactor * float64(attempt) * jitter))
 				time.Sleep(backoffTime)
 				continue
@@ -378,16 +376,68 @@ func FetchDocumentWithRetry(url string, referrer string, maxRetries int) (*goque
 	return nil, fmt.Errorf("all retry attempts failed: %v", lastErr)
 }
 
-func FetchDocument(url string) (*goquery.Document, error) {
+func FetchDocument(targetURL string) (*goquery.Document, error) {
+	// Check circuit breaker first
+	cb := GetCircuitBreaker()
+	if err := cb.Allow(); err != nil {
+		// Try FlareSolverr if available when circuit is open
+		fs := GetFlareSolverr()
+		if fs != nil && fs.IsConfigured() {
+			return fetchViaFlareSolverr(targetURL)
+		}
+		return nil, fmt.Errorf("service temporarily unavailable: %w", err)
+	}
+
 	// Ensure we have an active session
 	if err := ensureSession(); err != nil {
+		cb.RecordFailure()
+		// Try FlareSolverr as fallback
+		fs := GetFlareSolverr()
+		if fs != nil && fs.IsConfigured() {
+			return fetchViaFlareSolverr(targetURL)
+		}
 		return nil, err
 	}
 
 	// Add slight random delay to mimic human behavior
 	humanDelay()
 
-	return FetchDocumentWithRetry(url, "", 5) // Increase max retries to 5
+	doc, err := FetchDocumentWithRetry(targetURL, "", 5)
+	if err != nil {
+		cb.RecordFailure()
+
+		// Check if it's a Cloudflare issue and try FlareSolverr
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "forbidden") {
+			fs := GetFlareSolverr()
+			if fs != nil && fs.IsConfigured() {
+				return fetchViaFlareSolverr(targetURL)
+			}
+		}
+		return nil, err
+	}
+
+	cb.RecordSuccess()
+	return doc, nil
+}
+
+// fetchViaFlareSolverr fetches a document using FlareSolverr
+func fetchViaFlareSolverr(targetURL string) (*goquery.Document, error) {
+	fs := GetFlareSolverr()
+	if fs == nil || !fs.IsConfigured() {
+		return nil, fmt.Errorf("FlareSolverr not configured")
+	}
+
+	html, err := fs.Fetch(targetURL)
+	if err != nil {
+		return nil, fmt.Errorf("FlareSolverr fetch failed: %w", err)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML from FlareSolverr: %w", err)
+	}
+
+	return doc, nil
 }
 
 // GetCSRFToken fetches a page and extracts the CSRF token from a hidden input field.

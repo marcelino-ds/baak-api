@@ -1,0 +1,24 @@
+# Render Blueprint configuration
+# https://render.com/docs/blueprint-spec
+#
+# This deploys BAAK API with FlareSolverr in a single container
+
+services:
+  - type: web
+    name: baak-api
+    runtime: docker
+    plan: starter  # Docker requires at least starter plan on Render
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: CACHE_ENABLED
+        value: "true"
+      - key: CACHE_TTL_JADWAL
+        value: "300"
+      - key: CACHE_TTL_KALENDER
+        value: "3600"
+    healthCheckPath: /health
+
+

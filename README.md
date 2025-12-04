@@ -1,7 +1,10 @@
 # BAAK API
 
+> [!NOTE]  
+> **v2.0.0** - Now supports FlareSolverr for bypassing Cloudflare protection! See configuration below.
+
 > [!IMPORTANT]  
-> Currently not working due to BAAK implementing Cloudflare protection as of April 2025 _:3_
+> The BAAK website uses Cloudflare protection. For full functionality, you'll need to set up [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr).
 
 An unofficial API for BAAK.
 
@@ -16,10 +19,13 @@ Perlu diketahui bahwa proyek ini tidak berafiliasi dengan Universitas Gunadarma 
 - Informasi Kelas Baru
 - Jadwal UTS
 - Informasi Mahasiswa Baru
-- Rate limiting
+- Rate limiting (per-IP)
 - Dukungan CORS
-- Monitoring kesehatan
+- Monitoring kesehatan (dengan status komponen)
 - Format error yang terstandarisasi
+- **NEW**: FlareSolverr support untuk Cloudflare bypass
+- **NEW**: Circuit breaker pattern untuk resiliensi
+- **NEW**: In-memory caching untuk mengurangi beban
 
 ## Endpoint API
 
@@ -29,7 +35,10 @@ Perlu diketahui bahwa proyek ini tidak berafiliasi dengan Universitas Gunadarma 
 GET /health
 ```
 
-Mengembalikan status kesehatan API.
+Mengembalikan status kesehatan API dengan detail komponen:
+- Status FlareSolverr
+- Status circuit breaker
+- Statistik cache
 
 ### Jadwal Kuliah
 
@@ -105,29 +114,64 @@ Response error:
 ```json
 {
   "success": false,
-  "error": "Pesan error di sini"
+  "error": "Pesan error di sini",
+  "code": "ERROR_CODE"
 }
 ```
 
+Error codes:
+- `VALIDATION_ERROR` - Input tidak valid
+- `NOT_FOUND` - Resource tidak ditemukan
+- `CLOUDFLARE_BLOCKED` - Terblokir oleh Cloudflare
+- `CIRCUIT_OPEN` - Circuit breaker terbuka
+- `FLARESOLVERR_ERROR` - Error saat menggunakan FlareSolverr
+- `RATE_LIMITED` - Terlalu banyak request
+- `UPSTREAM_ERROR` - Error dari server BAAK
+- `SESSION_ERROR` - Gagal membuat session
+
 ## Rate Limiting
 
-API ini menggunakan rate limiting untuk mencegah penyalahgunaan. Secara default, mengizinkan 60 request per menit per alamat IP.
+API ini menggunakan per-IP rate limiting untuk mencegah penyalahgunaan. Default: 5 request per detik dengan burst 10.
 
 ## Konfigurasi
 
 API bisa dikonfigurasi menggunakan environment variables:
 
-- `PORT`: Port server (default: ":8080")
-- `BASE_URL`: URL dasar website BAAK (default: "https://baak.gunadarma.ac.id")
-- `RATE_LIMIT_PER_MIN`: Batas rate per menit (default: 60)
-- `ALLOWED_ORIGINS`: Daftar origin CORS yang diizinkan, dipisahkan dengan koma (default: "\*")
+| Variable | Default | Deskripsi |
+|----------|---------|-----------|
+| `PORT` | `:8080` | Port server |
+| `BASE_URL` | `https://baak.gunadarma.ac.id` | URL dasar website BAAK |
+| `RATE_LIMIT_PER_MIN` | `60` | Batas rate per menit (deprecated, now per-IP) |
+| `ALLOWED_ORIGINS` | `*` | Daftar origin CORS yang diizinkan |
+| `FLARESOLVERR_URL` | - | URL FlareSolverr (e.g., `http://localhost:8191`) |
+| `CACHE_TTL_JADWAL` | `300` | TTL cache jadwal dalam detik |
+| `CACHE_TTL_KALENDER` | `3600` | TTL cache kalender dalam detik |
+| `CACHE_ENABLED` | `true` | Enable/disable caching |
+
+## FlareSolverr Setup
+
+FlareSolverr diperlukan untuk melewati proteksi Cloudflare. Jalankan dengan Docker:
+
+```bash
+docker run -d \
+  --name flaresolverr \
+  -p 8191:8191 \
+  ghcr.io/flaresolverr/flaresolverr:latest
+```
+
+Kemudian set environment variable:
+
+```bash
+export FLARESOLVERR_URL=http://localhost:8191
+```
 
 ## Development
 
 ### Prasyarat
 
-- Go 1.16 atau lebih tinggi
+- Go 1.22 atau lebih tinggi
 - Git
+- Docker (untuk FlareSolverr)
 
 ### Setup
 
@@ -144,10 +188,27 @@ cd baak-api
 go mod download
 ```
 
-3. Jalankan server:
+3. (Optional) Jalankan FlareSolverr:
 
 ```bash
-go run api/index.go
+docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+```
+
+4. Jalankan server:
+
+```bash
+FLARESOLVERR_URL=http://localhost:8191 go run main.go
+```
+
+## Architecture
+
+```
+├── api/           # Vercel handler & routing
+├── config/        # Configuration management
+├── handlers/      # HTTP request handlers
+├── middleware/    # HTTP middleware (CORS, rate limiting, etc.)
+├── models/        # Data structures
+└── utils/         # Utilities (caching, circuit breaker, FlareSolverr, etc.)
 ```
 
 ## To-Do
@@ -157,9 +218,13 @@ go run api/index.go
 - [x] Mahasiswa Baru
 - [x] Mahasiswa Kelas 2 Baru
 - [x] UTS
+- [x] FlareSolverr Integration
+- [x] Circuit Breaker
+- [x] Caching Layer
 - [ ] UU
 - [ ] UAS
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
