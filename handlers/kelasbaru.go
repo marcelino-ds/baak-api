@@ -12,22 +12,29 @@ import (
 )
 
 func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
 	searchTerm := strings.TrimPrefix(r.URL.Path, "/kelasbaru/")
 	if searchTerm == "" {
 		utils.WriteValidationError(w, "Missing search term in URL")
 		return
 	}
+	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
+	if err != nil {
+		utils.WriteInternalServerError(w)
+		return
+	}
 
 	searchTypes := []string{"Kelas", "NPM", "Nama"}
 	var kelasBaru []models.KelasBaru
-	var err error
-
 	kelasBaruBaseURL := fmt.Sprintf("%s/cariKelasBaru", config.AppConfig.BaseURL)
-	token, err := utils.GetCSRFToken(kelasBaruBaseURL)
+	token, err := scraper.GetCSRFToken(r.Context(), kelasBaruBaseURL)
 	if err != nil {
-		token, err = utils.GetCSRFToken(config.AppConfig.BaseURL)
+		token, err = scraper.GetCSRFToken(r.Context(), config.AppConfig.BaseURL)
 		if err != nil {
-			utils.WriteErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get CSRF token for KelasBaru: %v", err))
+			utils.WriteHTTPError(w, err)
 			return
 		}
 	}
@@ -39,7 +46,7 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 			url.QueryEscape(searchType),
 			url.QueryEscape(searchTerm),
 		)
-		kelasBaru, err = utils.GetKelasbaru(searchURL)
+		kelasBaru, err = scraper.GetKelasbaru(r.Context(), searchURL)
 		if err != nil {
 			utils.WriteHTTPError(w, err)
 			return

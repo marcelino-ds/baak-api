@@ -2,19 +2,15 @@ package utils
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -23,67 +19,379 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Initialize cookie jar on package import
-func init() {
-	// Initialize cookie jar for session persistence
-	jar, err := cookiejar.New(&cookiejar.Options{
-		PublicSuffixList: publicsuffix.List,
-	})
-	if err != nil {
-		panic(fmt.Sprintf("Failed to create cookie jar: %v", err))
-	}
-	httpClient.Jar = jar
-}
-
 const (
 	BaseURL = "https://baak.gunadarma.ac.id"
-	BaseIP  = "103.23.40.57" // IP address for direct access
+	BaseIP  = "103.23.40.57"
 )
 
-// Session cookies and visited pages for more authentic requests
-var (
-	visitedPages = []string{
-		BaseURL,
-		BaseURL + "/jadwal",
-		BaseURL + "/kalender",
+var Limiter = rate.NewLimiter(rate.Limit(5), 10)
+
+const maxHTMLBodyBytes int64 = 8 << 20
+
+// Scraper owns the HTTP session for one API request. Keeping the client and
+// cookie jar together makes CSRF and FlareSolverr fallbacks use one session.
+type Scraper struct {
+	BaseURL      string
+	client       *http.Client
+	flareSolverr *FlareSolverr
+	breaker      *CircuitBreaker
+	referrer     string
+}
+
+// NewScraper creates a request-scoped scraper with a secure TLS client.
+func NewScraper(baseURL string) (*Scraper, error) {
+	if baseURL == "" {
+		baseURL = BaseURL
 	}
-	clientMutex = &sync.RWMutex{}
-)
-
-var (
-	httpClient = &http.Client{
-		Timeout: 60 * time.Second,
+	parsedURL, err := url.Parse(baseURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return nil, fmt.Errorf("invalid BAAK base URL %q", baseURL)
+	}
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cookie jar: %w", err)
+	}
+	client := &http.Client{
+		Timeout: httpTimeout,
+		Jar:     jar,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
-			MaxConnsPerHost:     10,
-			IdleConnTimeout:     60 * time.Second,
+			MaxConnsPerHost:     20,
+			IdleConnTimeout:     30 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
-			DisableCompression:  true,
-			ForceAttemptHTTP2:   false,
-			DisableKeepAlives:   false,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Skip verification for testing
-			},
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Allow up to 10 redirects
-			if len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			return nil
 		},
 	}
-)
+	if proxyManager := GetProxyManager(); proxyManager.HasProxies() {
+		proxyClient, err := proxyManager.GetClient()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create proxy client: %w", err)
+		}
+		client = proxyClient
+	}
+	return &Scraper{
+		BaseURL:      strings.TrimRight(baseURL, "/"),
+		client:       client,
+		flareSolverr: GetFlareSolverr(),
+		breaker:      GetCircuitBreaker(),
+		referrer:     strings.TrimRight(baseURL, "/"),
+	}, nil
+}
 
-var (
-	Limiter = rate.NewLimiter(rate.Limit(5), 10)
-)
+type upstreamStatusError struct {
+	code int
+}
+
+func (e upstreamStatusError) Error() string {
+	return fmt.Sprintf("unexpected status code: %d", e.code)
+}
+
+func (s *Scraper) ensureClient() error {
+	if s.client == nil {
+		return errors.New("scraper client is not configured")
+	}
+	if s.client.Jar == nil {
+		jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+		if err != nil {
+			return fmt.Errorf("failed to create cookie jar: %w", err)
+		}
+		s.client.Jar = jar
+	}
+	return nil
+}
+
+func (s *Scraper) fetchOnce(ctx context.Context, targetURL, referrer string) (*goquery.Document, error) {
+	if err := s.ensureClient(); err != nil {
+		return nil, err
+	}
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return nil, fmt.Errorf("invalid target URL %q", targetURL)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgents[0])
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8")
+	req.Header.Set("Referer", referrer)
+	response, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch URL: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, upstreamStatusError{code: response.StatusCode}
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxHTMLBodyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read HTML: %w", err)
+	}
+	if int64(len(body)) > maxHTMLBodyBytes {
+		return nil, errors.New("HTML response exceeds size limit")
+	}
+	if IsCloudflareChallenge(string(body)) {
+		return nil, errors.New("access forbidden (403): Cloudflare challenge")
+	}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %w", err)
+	}
+	return doc, nil
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *Scraper) fetchWithRetry(ctx context.Context, targetURL string, maxRetries int) (*goquery.Document, error) {
+	if maxRetries < 1 {
+		return nil, errors.New("max retries must be positive")
+	}
+	referrer := s.referrer
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		doc, err := s.fetchOnce(ctx, targetURL, referrer)
+		if err == nil {
+			s.referrer = targetURL
+			return doc, nil
+		}
+		lastErr = err
+		if isCloudflareError(err) {
+			break
+		}
+		var statusErr upstreamStatusError
+		if errors.As(err, &statusErr) && (statusErr.code == http.StatusForbidden || statusErr.code == http.StatusTooManyRequests) {
+			break
+		}
+		if attempt+1 < maxRetries {
+			if err := waitForRetry(ctx, time.Duration(250*(1<<attempt))*time.Millisecond); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, fmt.Errorf("all retry attempts failed: %w", lastErr)
+}
+
+func isCloudflareError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr upstreamStatusError
+	return errors.As(err, &statusErr) && statusErr.code == http.StatusForbidden || strings.Contains(err.Error(), "Cloudflare challenge")
+}
+
+// FetchDocument fetches HTML, retries transient failures, and falls back to FlareSolverr.
+func (s *Scraper) FetchDocument(ctx context.Context, targetURL string) (*goquery.Document, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.breaker == nil {
+		s.breaker = GetCircuitBreaker()
+	}
+	if err := s.ensureClient(); err != nil {
+		return nil, err
+	}
+	if err := s.breaker.Allow(); err != nil {
+		if s.flareSolverr == nil {
+			return nil, fmt.Errorf("service temporarily unavailable: %w", err)
+		}
+		return s.fetchFlareSolverr(ctx, targetURL)
+	}
+	doc, err := s.fetchWithRetry(ctx, targetURL, 3)
+	if err == nil {
+		s.breaker.RecordSuccess()
+		return doc, nil
+	}
+	if isCloudflareError(err) && s.flareSolverr != nil {
+		doc, flareErr := s.fetchFlareSolverr(ctx, targetURL)
+		if flareErr == nil {
+			s.breaker.RecordSuccess()
+			return doc, nil
+		}
+		err = flareErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	s.breaker.RecordFailure()
+	return nil, err
+}
+
+func (s *Scraper) fetchFlareSolverr(ctx context.Context, targetURL string) (*goquery.Document, error) {
+	if s.flareSolverr == nil {
+		return nil, errors.New("FlareSolverr not configured")
+	}
+	html, err := s.flareSolverr.FetchContext(ctx, targetURL, s.client.Jar)
+	if err != nil {
+		return nil, fmt.Errorf("FlareSolverr fetch failed: %w", err)
+	}
+	if IsCloudflareChallenge(html) {
+		return nil, errors.New("FlareSolverr returned a Cloudflare challenge")
+	}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML from FlareSolverr: %w", err)
+	}
+	return doc, nil
+}
+
+// GetCSRFToken fetches a page using this scraper and extracts its CSRF token.
+func (s *Scraper) GetCSRFToken(ctx context.Context, targetURL string) (string, error) {
+	doc, err := s.FetchDocument(ctx, targetURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch document for CSRF token: %w", err)
+	}
+	token, exists := doc.Find(`input[name="_token"]`).First().Attr("value")
+	if !exists {
+		return "", fmt.Errorf("CSRF token input field not found on page: %s", targetURL)
+	}
+	return token, nil
+}
+
+func (s *Scraper) GetTimeStampLUT(ctx context.Context) ([][]string, error) {
+	doc, err := s.FetchDocument(ctx, s.BaseURL+"/kuliahUjian/6")
+	if err != nil {
+		return nil, err
+	}
+	result := make([][]string, 0)
+	doc.Find("table.cell-xs-6 tr").Each(func(_ int, row *goquery.Selection) {
+		cells := row.Find("td")
+		if cells.Length() < 2 {
+			return
+		}
+		timeRange := strings.NewReplacer(" ", "", ".", ":").Replace(strings.TrimSpace(cells.Eq(1).Text()))
+		times := strings.Split(timeRange, "-")
+		if len(times) == 2 {
+			result = append(result, times)
+		}
+	})
+	return result, nil
+}
+
+func (s *Scraper) GetJadwal(ctx context.Context, targetURL string) (models.Jadwal, error) {
+	doc, err := s.FetchDocument(ctx, targetURL)
+	if err != nil {
+		return models.Jadwal{}, err
+	}
+	lut, err := s.GetTimeStampLUT(ctx)
+	if err != nil {
+		return models.Jadwal{}, err
+	}
+	jadwal := models.Jadwal{}
+	hariMap := map[string]*[]models.MataKuliah{
+		"Senin": &jadwal.Senin, "Selasa": &jadwal.Selasa, "Rabu": &jadwal.Rabu,
+		"Kamis": &jadwal.Kamis, "Jum'at": &jadwal.Jumat, "Sabtu": &jadwal.Sabtu,
+	}
+	doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+		cells := row.Find("td")
+		if cells.Length() < 6 {
+			return
+		}
+		course := models.MataKuliah{
+			Nama: strings.TrimSpace(cells.Eq(2).Text()), Waktu: strings.TrimSpace(cells.Eq(3).Text()),
+			Jam:   convertWaktuToJam(strings.TrimSpace(cells.Eq(3).Text()), lut),
+			Ruang: strings.TrimSpace(cells.Eq(4).Text()), Dosen: strings.TrimSpace(cells.Eq(5).Text()),
+		}
+		if day, ok := hariMap[strings.TrimSpace(cells.Eq(1).Text())]; ok {
+			*day = append(*day, course)
+		}
+	})
+	return jadwal, nil
+}
+
+func (s *Scraper) GetKegiatan(ctx context.Context) ([]models.Kegiatan, error) {
+	doc, err := s.FetchDocument(ctx, s.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	activities := make([]models.Kegiatan, 0)
+	parent := ""
+	doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+		cells := row.Find("td")
+		if cells.Length() != 2 {
+			parent = ""
+			return
+		}
+		name, date := strings.TrimSpace(cells.Eq(0).Text()), strings.TrimSpace(cells.Eq(1).Text())
+		if date == "" {
+			parent = name
+			return
+		}
+		start, end := parseTanggal(date)
+		if parent != "" && isSubItem(name) {
+			name = parent + " " + name
+		} else {
+			parent = ""
+		}
+		activities = append(activities, models.Kegiatan{Kegiatan: name, Tanggal: date, Start: start, End: end})
+	})
+	return activities, nil
+}
+
+func (s *Scraper) GetKelasbaru(ctx context.Context, targetURL string) ([]models.KelasBaru, error) {
+	items := make([]models.KelasBaru, 0)
+	for page := 1; ; page++ {
+		doc, err := s.FetchDocument(ctx, fmt.Sprintf("%s&page=%d", targetURL, page))
+		if err != nil {
+			return nil, err
+		}
+		doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+			cells := row.Find("td")
+			if cells.Length() == 5 {
+				items = append(items, models.KelasBaru{NPM: strings.TrimSpace(cells.Eq(1).Text()), Nama: strings.TrimSpace(cells.Eq(2).Text()), KelasLama: strings.TrimSpace(cells.Eq(3).Text()), KelasBaru: strings.TrimSpace(cells.Eq(4).Text())})
+			}
+		})
+		if doc.Find(`a[rel="next"]`).Length() == 0 {
+			return items, nil
+		}
+	}
+}
+
+func (s *Scraper) GetMahasiswaBaru(ctx context.Context, targetURL string) ([]models.MahasiswaBaru, error) {
+	items := make([]models.MahasiswaBaru, 0)
+	for page := 1; ; page++ {
+		doc, err := s.FetchDocument(ctx, fmt.Sprintf("%s&page=%d", targetURL, page))
+		if err != nil {
+			return nil, err
+		}
+		doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+			cells := row.Find("td")
+			if cells.Length() == 6 {
+				items = append(items, models.MahasiswaBaru{NoPend: strings.TrimSpace(cells.Eq(1).Text()), Nama: strings.TrimSpace(cells.Eq(2).Text()), NPM: strings.TrimSpace(cells.Eq(3).Text()), Kelas: strings.TrimSpace(cells.Eq(4).Text()), Keterangan: strings.TrimSpace(cells.Eq(5).Text())})
+			}
+		})
+		if doc.Find(`a[rel="next"]`).Length() == 0 {
+			return items, nil
+		}
+	}
+}
+
+func (s *Scraper) GetUTS(ctx context.Context, targetURL string) ([]models.UTS, error) {
+	doc, err := s.FetchDocument(ctx, targetURL)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]models.UTS, 0)
+	doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+		cells := row.Find("td")
+		if cells.Length() == 5 {
+			items = append(items, models.UTS{Nama: strings.TrimSpace(cells.Eq(1).Text()), Waktu: strings.TrimSpace(cells.Eq(2).Text()), Ruang: strings.TrimSpace(cells.Eq(3).Text()), Dosen: strings.TrimSpace(cells.Eq(4).Text())})
+		}
+	})
+	return items, nil
+}
 
 // List of common user agents to rotate through
 var userAgents = []string{
@@ -94,445 +402,11 @@ var userAgents = []string{
 	"Mozilla/5.0 (iPad; CPU OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
 }
 
-// Additional realistic accept-language values
-var acceptLanguages = []string{
-	"en-US,en;q=0.9",
-	"en-GB,en;q=0.8,en-US;q=0.9",
-	"en-CA,en-US;q=0.9,en;q=0.8",
-	"en-AU,en;q=0.9,en-GB;q=0.8",
-	"id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-// Simulate human-like delays
-func humanDelay() {
-	// Random delay between 1-3 seconds to simulate human interaction
-	delay := 1000 + rand.IntN(2000)
-	time.Sleep(time.Duration(delay) * time.Millisecond)
-}
-
-// getClient returns an HTTP client, potentially with a different proxy
-func getClient() *http.Client {
-	clientMutex.Lock()
-	defer clientMutex.Unlock()
-
-	// If we have proxies configured, try to use them
-	proxyManager := GetProxyManager()
-	if proxyManager.HasProxies() {
-		client, err := proxyManager.GetClient()
-		if err == nil {
-			return client
-		}
-		// If error, fall back to default client
-	}
-
-	return httpClient
-}
-
-// directIPRequest makes a request directly to the server's IP address
-func directIPRequest() error {
-	// Attempt direct connection via IP
-	directURL := fmt.Sprintf("http://%s", BaseIP)
-	req, err := http.NewRequest("GET", directURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create direct IP request: %v", err)
-	}
-
-	// Set headers to appear as a genuine browser request
-	req.Host = "baak.gunadarma.ac.id" // Set the Host header to the domain name
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-
-	// Execute the request
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("direct IP request failed: %v", err)
-	}
-	defer res.Body.Close()
-
-	// Read and discard the body to ensure connection reuse
-	_, err = io.Copy(io.Discard, res.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	// Check cookies
-	baseUrl, _ := url.Parse(BaseURL)
-	clientMutex.RLock()
-	hasCookies := len(httpClient.Jar.Cookies(baseUrl)) > 0
-	clientMutex.RUnlock()
-
-	if !hasCookies {
-		return fmt.Errorf("no cookies established with direct IP request")
-	}
-
-	return nil
-}
-
-// simpleRequest makes a very basic request to the given URL
-func simpleRequest(targetURL string) error {
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %v", err)
-	}
-	defer res.Body.Close()
-
-	// Read and discard the body to ensure connection reuse
-	_, err = io.Copy(io.Discard, res.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	return nil
-}
-
-// Warm up the session by visiting the homepage first
-func ensureSession() error {
-	// Visit the homepage first to establish cookies if we haven't done so already
-	baseUrl, err := url.Parse(BaseURL)
-	if err != nil {
-		return fmt.Errorf("failed to parse base URL: %v", err)
-	}
-
-	// Check if we already have cookies for this domain
-	clientMutex.RLock()
-	hasCookies := len(httpClient.Jar.Cookies(baseUrl)) > 0
-	clientMutex.RUnlock()
-
-	if !hasCookies {
-		fmt.Println("[DEBUG] No cookies found, trying to establish session")
-
-		// Try HTTP first (some sites redirect HTTP to HTTPS)
-		err := simpleRequest("http://baak.gunadarma.ac.id")
-		if err == nil {
-			// Check if we got cookies
-			clientMutex.RLock()
-			hasCookies := len(httpClient.Jar.Cookies(baseUrl)) > 0
-			clientMutex.RUnlock()
-
-			if hasCookies {
-				fmt.Println("[DEBUG] Session established using HTTP request")
-				return nil
-			}
-		} else {
-			fmt.Printf("[DEBUG] simpleRequest(HTTP: %s) failed: %v\n", "http://baak.gunadarma.ac.id", err)
-		}
-
-		// Try HTTPS
-		err = simpleRequest(BaseURL)
-		if err == nil {
-			// Check if we got cookies
-			clientMutex.RLock()
-			hasCookies := len(httpClient.Jar.Cookies(baseUrl)) > 0
-			clientMutex.RUnlock()
-
-			if hasCookies {
-				fmt.Println("[DEBUG] Session established using HTTPS request")
-				return nil
-			}
-		} else {
-			fmt.Printf("[DEBUG] simpleRequest(HTTPS: %s) failed: %v\n", BaseURL, err)
-		}
-
-		// Try direct IP access as a last resort
-		// fmt.Println("[DEBUG] Trying direct IP access method")
-		// err = directIPRequest()
-		// if err != nil {
-		// 	 return fmt.Errorf("failed to establish session: %v", err)
-		// } else {
-		// 	 fmt.Println("[DEBUG] Session established using direct IP method")
-		// }
-
-		// If all methods failed without cookies
-		clientMutex.RLock()
-		hasCookiesAfterAttempts := len(httpClient.Jar.Cookies(baseUrl)) > 0
-		clientMutex.RUnlock()
-		if !hasCookiesAfterAttempts {
-			return fmt.Errorf("failed to establish session after trying HTTP, HTTPS (check logs for details)")
-		}
-
-	} else {
-		fmt.Println("[DEBUG] Session already established")
-	}
-
-	return nil
-}
-
-// Fetch a document with proper referrer and headers
-func FetchDocumentWithRetry(url string, referrer string, maxRetries int) (*goquery.Document, error) {
-	backoffFactor := 2.0
-	initialBackoff := 1 * time.Second
-	var lastErr error
-
-	// Use a default referrer if none provided
-	if referrer == "" {
-		if len(visitedPages) > 0 {
-			referrer = visitedPages[rand.IntN(len(visitedPages))]
-		} else {
-			referrer = BaseURL
-		}
-	}
-
-	// Get a client (may have a different proxy)
-	client := getClient()
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Add human-like delay between attempts
-		if attempt > 0 {
-			humanDelay()
-
-			// For retry attempts, try to get a fresh client with potentially different proxy
-			if attempt > 1 {
-				client = getClient()
-			}
-		}
-
-		// Create a context with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-
-		// Create a new request
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %v", err)
-		}
-
-		// Randomize User-Agent and other headers
-		userAgent := userAgents[rand.IntN(len(userAgents))]
-		acceptLang := acceptLanguages[rand.IntN(len(acceptLanguages))]
-
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-		req.Header.Set("Accept-Language", acceptLang)
-		req.Header.Set("Connection", "keep-alive")
-		req.Header.Set("Upgrade-Insecure-Requests", "1")
-		req.Header.Set("Referer", referrer)
-		req.Header.Set("Sec-Fetch-Dest", "document")
-		req.Header.Set("Sec-Fetch-Mode", "navigate")
-		req.Header.Set("Sec-Fetch-Site", "same-origin")
-		req.Header.Set("Sec-Fetch-User", "?1")
-		req.Header.Set("Cache-Control", "max-age=0")
-
-		// Add a pseudo-random request ID to make each request unique
-		req.Header.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
-
-		// Execute the request
-		res, err := client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to fetch URL: %v", err)
-			backoffTime := time.Duration(float64(initialBackoff) * (backoffFactor * float64(attempt)))
-			time.Sleep(backoffTime)
-			continue
-		}
-		defer res.Body.Close()
-
-		// Handle response based on status code
-		if res.StatusCode != http.StatusOK {
-			if res.StatusCode == http.StatusForbidden {
-				lastErr = fmt.Errorf("access forbidden (403): the server might be restricting access or detecting automated requests")
-				// For 403 errors, use a longer backoff with random jitter
-				jitter := 1.0 + (rand.Float64() * 0.5) // 1.0-1.5 jitter factor
-				backoffTime := time.Duration(float64(initialBackoff*3) * (backoffFactor * float64(attempt) * jitter))
-				time.Sleep(backoffTime)
-				continue
-			}
-
-			lastErr = fmt.Errorf("unexpected status code: %d %s", res.StatusCode, res.Status)
-			if attempt < maxRetries-1 {
-				backoffTime := time.Duration(float64(initialBackoff) * (backoffFactor * float64(attempt)))
-				time.Sleep(backoffTime)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		// Store current URL as visited page for future referrers
-		if len(visitedPages) > 5 {
-			// Keep the list to a reasonable size
-			visitedPages = visitedPages[1:]
-		}
-		visitedPages = append(visitedPages, url)
-
-		// Successfully got a 200 OK response, parse the document
-		doc, err := goquery.NewDocumentFromReader(res.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse HTML: %v", err)
-		}
-
-		return doc, nil
-	}
-
-	// If we got here, all attempts failed
-	return nil, fmt.Errorf("all retry attempts failed: %v", lastErr)
-}
-
-func FetchDocument(targetURL string) (*goquery.Document, error) {
-	// Check circuit breaker first
-	cb := GetCircuitBreaker()
-	if err := cb.Allow(); err != nil {
-		// Try FlareSolverr if available when circuit is open
-		fs := GetFlareSolverr()
-		if fs != nil && fs.IsConfigured() {
-			return fetchViaFlareSolverr(targetURL)
-		}
-		return nil, fmt.Errorf("service temporarily unavailable: %w", err)
-	}
-
-	// Ensure we have an active session
-	if err := ensureSession(); err != nil {
-		cb.RecordFailure()
-		// Try FlareSolverr as fallback
-		fs := GetFlareSolverr()
-		if fs != nil && fs.IsConfigured() {
-			return fetchViaFlareSolverr(targetURL)
-		}
-		return nil, err
-	}
-
-	// Add slight random delay to mimic human behavior
-	humanDelay()
-
-	doc, err := FetchDocumentWithRetry(targetURL, "", 5)
-	if err != nil {
-		cb.RecordFailure()
-
-		// Check if it's a Cloudflare issue and try FlareSolverr
-		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "forbidden") {
-			fs := GetFlareSolverr()
-			if fs != nil && fs.IsConfigured() {
-				return fetchViaFlareSolverr(targetURL)
-			}
-		}
-		return nil, err
-	}
-
-	cb.RecordSuccess()
-	return doc, nil
-}
-
-// fetchViaFlareSolverr fetches a document using FlareSolverr
-func fetchViaFlareSolverr(targetURL string) (*goquery.Document, error) {
-	fs := GetFlareSolverr()
-	if fs == nil || !fs.IsConfigured() {
-		return nil, fmt.Errorf("FlareSolverr not configured")
-	}
-
-	html, err := fs.Fetch(targetURL)
-	if err != nil {
-		return nil, fmt.Errorf("FlareSolverr fetch failed: %w", err)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse HTML from FlareSolverr: %w", err)
-	}
-
-	return doc, nil
-}
-
-// GetCSRFToken fetches a page and extracts the CSRF token from a hidden input field.
-func GetCSRFToken(url string) (string, error) {
-	doc, err := FetchDocument(url)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch document for CSRF token: %w", err)
-	}
-
-	token, exists := doc.Find("input[name=\"_token\"]").First().Attr("value")
-	if !exists {
-		// Optionally log the HTML body here for debugging if token is not found
-		// html, _ := doc.Html()
-		// fmt.Println("DEBUG: HTML body:\n", html)
-		return "", errors.New("CSRF token input field not found on page: " + url)
-	}
-
-	return token, nil
-}
-
-func GetJadwal(url string) (models.Jadwal, error) {
-	doc, err := FetchDocument(url)
-	if err != nil {
-		return models.Jadwal{}, err
-	}
-
-	jadwal := models.Jadwal{}
-	hariMap := map[string]*[]models.MataKuliah{
-		"Senin":  &jadwal.Senin,
-		"Selasa": &jadwal.Selasa,
-		"Rabu":   &jadwal.Rabu,
-		"Kamis":  &jadwal.Kamis,
-		"Jum'at": &jadwal.Jumat,
-		"Sabtu":  &jadwal.Sabtu,
-	}
-
-	timeStampLUT, err := GetTimeStampLUT()
-	if err != nil {
-		return models.Jadwal{}, err
-	}
-
-	doc.Find("table").First().Find("tr").Each(func(i int, row *goquery.Selection) {
-		cells := row.Find("td")
-		if cells.Length() < 5 {
-			return
-		}
-
-		hari := strings.TrimSpace(cells.Eq(1).Text())
-		waktu := strings.TrimSpace(cells.Eq(3).Text())
-		jam := convertWaktuToJam(waktu, timeStampLUT)
-
-		mataKuliah := models.MataKuliah{
-			Nama:  strings.TrimSpace(cells.Eq(2).Text()),
-			Waktu: waktu,
-			Jam:   jam,
-			Ruang: strings.TrimSpace(cells.Eq(4).Text()),
-			Dosen: strings.TrimSpace(cells.Eq(5).Text()),
-		}
-
-		if hariSlice, ok := hariMap[hari]; ok {
-			*hariSlice = append(*hariSlice, mataKuliah)
-		}
-	})
-
-	return jadwal, nil
-}
-
-func GetTimeStampLUT() ([][]string, error) {
-	doc, err := FetchDocument(BaseURL + "/kuliahUjian/6")
-	if err != nil {
-		return nil, err
-	}
-
-	var result [][]string
-	doc.Find("table.cell-xs-6 tr").Each(func(i int, row *goquery.Selection) {
-		cells := row.Find("td")
-		if cells.Length() >= 2 {
-			timeRange := strings.TrimSpace(cells.Eq(1).Text())
-			timeRange = strings.ReplaceAll(timeRange, " ", "")
-			timeRange = strings.ReplaceAll(timeRange, ".", ":")
-			times := strings.Split(timeRange, "-")
-			if len(times) == 2 {
-				result = append(result, times)
-			}
-		}
-	})
-
-	return result, nil
-}
-
 func convertWaktuToJam(waktu string, timeStampLUT [][]string) string {
 	re := regexp.MustCompile(`(\d+)`)
 	matches := re.FindAllString(waktu, -1)
 
-	if len(matches) < 2 || len(matches) > 3 || len(timeStampLUT) == 0 {
+	if len(matches) == 0 || len(timeStampLUT) == 0 {
 		return ""
 	}
 
@@ -542,52 +416,11 @@ func convertWaktuToJam(waktu string, timeStampLUT [][]string) string {
 	if start < 1 || start > len(timeStampLUT) || end < 1 || end > len(timeStampLUT) {
 		return ""
 	}
-
-	return timeStampLUT[start-1][0] + " - " + timeStampLUT[end-1][1]
-}
-
-func GetKegiatan(url string) ([]models.Kegiatan, error) {
-	doc, err := FetchDocument(url)
-	if err != nil {
-		return nil, err
+	if start > end {
+		return ""
 	}
 
-	var kegiatanList []models.Kegiatan
-	var parentKegiatan string
-
-	doc.Find("table").First().Find("tr").Each(func(i int, row *goquery.Selection) {
-		cells := row.Find("td")
-		if cells.Length() == 2 {
-			kegiatanText := strings.TrimSpace(cells.Eq(0).Text())
-			tanggalText := strings.TrimSpace(cells.Eq(1).Text())
-
-			if tanggalText == "" {
-				parentKegiatan = kegiatanText
-				return
-			}
-
-			start, end := parseTanggal(tanggalText)
-
-			fullKegiatan := kegiatanText
-			if parentKegiatan != "" && isSubItem(kegiatanText) {
-				fullKegiatan = parentKegiatan + " " + kegiatanText
-			} else {
-				parentKegiatan = ""
-			}
-
-			kegiatan := models.Kegiatan{
-				Kegiatan: fullKegiatan,
-				Tanggal:  tanggalText,
-				Start:    start,
-				End:      end,
-			}
-			kegiatanList = append(kegiatanList, kegiatan)
-		} else {
-			parentKegiatan = ""
-		}
-	})
-
-	return kegiatanList, nil
+	return timeStampLUT[start-1][0] + " - " + timeStampLUT[end-1][1]
 }
 
 func isSubItem(text string) bool {
@@ -607,99 +440,90 @@ func parseTanggal(tanggal string) (start, end string) {
 	return start, end
 }
 
-func GetKelasbaru(baseURL string) ([]models.KelasBaru, error) {
-	var kelasBaru []models.KelasBaru
-	page := 1
-
-	for {
-		url := fmt.Sprintf("%s&page=%d", baseURL, page)
-		doc, err := FetchDocument(url)
-		if err != nil {
-			return nil, err
-		}
-
-		doc.Find("table").First().Find("tr").Each(func(i int, row *goquery.Selection) {
-			cells := row.Find("td")
-			if cells.Length() == 5 {
-				mhs := models.KelasBaru{
-					NPM:       strings.TrimSpace(cells.Eq(1).Text()),
-					Nama:      strings.TrimSpace(cells.Eq(2).Text()),
-					KelasLama: strings.TrimSpace(cells.Eq(3).Text()),
-					KelasBaru: strings.TrimSpace(cells.Eq(4).Text()),
-				}
-				kelasBaru = append(kelasBaru, mhs)
-			}
-		})
-
-		if doc.Find(`a[rel="next"]`).Length() == 0 {
-			break
-		}
-
-		page++
-	}
-
-	return kelasBaru, nil
-}
-
-func GetMahasiswaBaru(url string) ([]models.MahasiswaBaru, error) {
-	var mahasiswaBaru []models.MahasiswaBaru
-	page := 1
-
-	for {
-		pageURL := fmt.Sprintf("%s&page=%d", url, page)
-		doc, err := FetchDocument(pageURL)
-		if err != nil {
-			return nil, err
-		}
-
-		doc.Find("table").First().Find("tr").Each(func(i int, row *goquery.Selection) {
-			cells := row.Find("td")
-			if cells.Length() == 6 {
-				mhs := models.MahasiswaBaru{
-					NoPend:     strings.TrimSpace(cells.Eq(1).Text()),
-					Nama:       strings.TrimSpace(cells.Eq(2).Text()),
-					NPM:        strings.TrimSpace(cells.Eq(3).Text()),
-					Kelas:      strings.TrimSpace(cells.Eq(4).Text()),
-					Keterangan: strings.TrimSpace(cells.Eq(5).Text()),
-				}
-				mahasiswaBaru = append(mahasiswaBaru, mhs)
-			}
-		})
-
-		if doc.Find(`a[rel="next"]`).Length() == 0 {
-			break
-		}
-
-		page++
-	}
-
-	return mahasiswaBaru, nil
-}
-
-func GetUTS(url string) ([]models.UTS, error) {
-	doc, err := FetchDocument(url)
+// FetchDocumentWithRetry keeps the original utility API for callers that do
+// not need a request context or FlareSolverr fallback.
+func FetchDocumentWithRetry(targetURL, referrer string, maxRetries int) (*goquery.Document, error) {
+	scraper, err := NewScraper(BaseURL)
 	if err != nil {
 		return nil, err
 	}
-
-	var utsList []models.UTS
-	doc.Find("table").First().Find("tr").Each(func(i int, row *goquery.Selection) {
-		cells := row.Find("td")
-		if cells.Length() == 5 {
-			uts := models.UTS{
-				Nama:  strings.TrimSpace(cells.Eq(1).Text()),
-				Waktu: strings.TrimSpace(cells.Eq(2).Text()),
-				Ruang: strings.TrimSpace(cells.Eq(3).Text()),
-				Dosen: strings.TrimSpace(cells.Eq(4).Text()),
-			}
-			utsList = append(utsList, uts)
-		}
-	})
-
-	return utsList, nil
+	if referrer != "" {
+		scraper.referrer = referrer
+	}
+	return scraper.fetchWithRetry(context.Background(), targetURL, maxRetries)
 }
 
-// EnsureSessionPublic is a public wrapper around ensureSession
+func FetchDocument(targetURL string) (*goquery.Document, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return scraper.FetchDocument(context.Background(), targetURL)
+}
+
+func GetCSRFToken(targetURL string) (string, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return "", err
+	}
+	return scraper.GetCSRFToken(context.Background(), targetURL)
+}
+
+func GetJadwal(targetURL string) (models.Jadwal, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return models.Jadwal{}, err
+	}
+	return scraper.GetJadwal(context.Background(), targetURL)
+}
+
+func GetTimeStampLUT() ([][]string, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return scraper.GetTimeStampLUT(context.Background())
+}
+
+func GetKegiatan(targetURL string) ([]models.Kegiatan, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	scraper.BaseURL = strings.TrimRight(targetURL, "/")
+	return scraper.GetKegiatan(context.Background())
+}
+
+func GetKelasbaru(targetURL string) ([]models.KelasBaru, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return scraper.GetKelasbaru(context.Background(), targetURL)
+}
+
+func GetMahasiswaBaru(targetURL string) ([]models.MahasiswaBaru, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return scraper.GetMahasiswaBaru(context.Background(), targetURL)
+}
+
+func GetUTS(targetURL string) ([]models.UTS, error) {
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return scraper.GetUTS(context.Background(), targetURL)
+}
+
+// EnsureSessionPublic is retained for the diagnostic command.
 func EnsureSessionPublic() error {
-	return ensureSession()
+	scraper, err := NewScraper(BaseURL)
+	if err != nil {
+		return err
+	}
+	_, err = scraper.FetchDocument(context.Background(), BaseURL)
+	return err
 }

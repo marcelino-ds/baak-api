@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -10,9 +11,9 @@ import (
 
 func main() {
 	fmt.Println("Testing session establishment...")
-	err := utils.EnsureSessionPublic()
+	scraper, err := utils.NewScraper(utils.BaseURL)
 	if err != nil {
-		fmt.Printf("Error establishing session: %v\n", err)
+		fmt.Printf("Error creating scraper: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -35,7 +36,7 @@ func main() {
 
 	for _, testURL := range urls {
 		fmt.Printf("Trying URL: %s\n", testURL)
-		tempDoc, err := utils.FetchDocument(testURL)
+		tempDoc, err := scraper.FetchDocument(context.Background(), testURL)
 		if err == nil {
 			doc = tempDoc
 			successURL = testURL

@@ -6,10 +6,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yafyx/baak-api/config"
 	"github.com/yafyx/baak-api/handlers"
 	"github.com/yafyx/baak-api/middleware"
 	"github.com/yafyx/baak-api/utils"
 )
+
+func init() {
+	config.LoadConfig()
+}
 
 func Handler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)

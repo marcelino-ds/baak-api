@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,9 +14,10 @@ import (
 
 // FlareSolverrRequest represents a request to FlareSolverr
 type FlareSolverrRequest struct {
-	Cmd        string `json:"cmd"`
-	URL        string `json:"url"`
-	MaxTimeout int    `json:"maxTimeout"`
+	Cmd        string        `json:"cmd"`
+	URL        string        `json:"url"`
+	MaxTimeout int           `json:"maxTimeout"`
+	Cookies    []FlareCookie `json:"cookies,omitempty"`
 }
 
 // FlareSolverrResponse represents a response from FlareSolverr
@@ -34,13 +36,13 @@ type FlareSolverrResponse struct {
 
 // FlareCookie represents a cookie from FlareSolverr
 type FlareCookie struct {
-	Name     string `json:"name"`
-	Value    string `json:"value"`
-	Domain   string `json:"domain"`
-	Path     string `json:"path"`
-	Expires  int64  `json:"expires"`
-	HttpOnly bool   `json:"httpOnly"`
-	Secure   bool   `json:"secure"`
+	Name     string  `json:"name"`
+	Value    string  `json:"value"`
+	Domain   string  `json:"domain,omitempty"`
+	Path     string  `json:"path,omitempty"`
+	Expires  float64 `json:"expires,omitempty"`
+	HttpOnly bool    `json:"httpOnly,omitempty"`
+	Secure   bool    `json:"secure,omitempty"`
 }
 
 // FlareSolverr handles requests through FlareSolverr proxy
@@ -49,22 +51,16 @@ type FlareSolverr struct {
 	client *http.Client
 }
 
-var globalFlareSolverr *FlareSolverr
-
 // GetFlareSolverr returns the FlareSolverr instance if configured
 func GetFlareSolverr() *FlareSolverr {
-	if globalFlareSolverr == nil {
-		url := os.Getenv("FLARESOLVERR_URL")
-		if url != "" {
-			globalFlareSolverr = &FlareSolverr{
-				url: url,
-				client: &http.Client{
-					Timeout: 120 * time.Second, // FlareSolverr can take a while
-				},
-			}
-		}
+	url := strings.TrimRight(os.Getenv("FLARESOLVERR_URL"), "/")
+	if url == "" {
+		return nil
 	}
-	return globalFlareSolverr
+	return &FlareSolverr{
+		url:    url,
+		client: &http.Client{Timeout: 120 * time.Second},
+	}
 }
 
 // IsConfigured returns true if FlareSolverr is configured
@@ -74,6 +70,14 @@ func (fs *FlareSolverr) IsConfigured() bool {
 
 // Fetch fetches a URL through FlareSolverr
 func (fs *FlareSolverr) Fetch(targetURL string) (string, error) {
+	return fs.FetchContext(context.Background(), targetURL, nil)
+}
+
+// FetchContext fetches a URL through FlareSolverr while honoring cancellation.
+func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar http.CookieJar) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if fs == nil || fs.url == "" {
 		return "", fmt.Errorf("FlareSolverr not configured")
 	}
@@ -83,27 +87,40 @@ func (fs *FlareSolverr) Fetch(targetURL string) (string, error) {
 		URL:        targetURL,
 		MaxTimeout: 60000, // 60 seconds
 	}
+	if jar != nil {
+		if parsedURL, err := http.NewRequest(http.MethodGet, targetURL, nil); err == nil {
+			for _, cookie := range jar.Cookies(parsedURL.URL) {
+				reqBody.Cookies = append(reqBody.Cookies, FlareCookie{
+					Name:  cookie.Name,
+					Value: cookie.Value,
+				})
+			}
+		}
+	}
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %v", err)
+		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", fs.url+"/v1", bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fs.url+"/v1", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %v", err)
+		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := fs.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to send request: %v", err)
+		return "", fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTMLBodyBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("failed to read response: %v", err)
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	if int64(len(body)) > maxHTMLBodyBytes {
+		return "", fmt.Errorf("FlareSolverr response exceeds size limit")
 	}
 
 	var fsResp FlareSolverrResponse
@@ -114,19 +131,53 @@ func (fs *FlareSolverr) Fetch(targetURL string) (string, error) {
 	if fsResp.Status != "ok" {
 		return "", fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
 	}
+	if fsResp.Solution.Status != http.StatusOK {
+		return "", fmt.Errorf("FlareSolverr unexpected status code: %d", fsResp.Solution.Status)
+	}
+	if jar != nil {
+		cookieURL := targetURL
+		if fsResp.Solution.URL != "" {
+			cookieURL = fsResp.Solution.URL
+		}
+		if parsedURL, err := http.NewRequest(http.MethodGet, cookieURL, nil); err == nil {
+			cookies := make([]*http.Cookie, 0, len(fsResp.Solution.Cookies))
+			for _, cookie := range fsResp.Solution.Cookies {
+				httpCookie := &http.Cookie{Name: cookie.Name, Value: cookie.Value, Path: cookie.Path}
+				if cookie.Expires > 0 {
+					httpCookie.Expires = time.Unix(int64(cookie.Expires), 0)
+				}
+				cookies = append(cookies, httpCookie)
+			}
+			if len(cookies) > 0 {
+				jar.SetCookies(parsedURL.URL, cookies)
+			}
+		}
+	}
 
 	return fsResp.Solution.Response, nil
 }
 
 // CheckHealth checks if FlareSolverr is reachable and working
 func (fs *FlareSolverr) CheckHealth() error {
+	return fs.CheckHealthContext(context.Background())
+}
+
+// CheckHealthContext checks FlareSolverr while honoring request cancellation.
+func (fs *FlareSolverr) CheckHealthContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if fs == nil || fs.url == "" {
 		return fmt.Errorf("FlareSolverr not configured")
 	}
 
-	resp, err := fs.client.Get(fs.url + "/health")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fs.url+"/health", nil)
 	if err != nil {
-		return fmt.Errorf("failed to reach FlareSolverr: %v", err)
+		return fmt.Errorf("failed to create FlareSolverr health request: %w", err)
+	}
+	resp, err := fs.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach FlareSolverr: %w", err)
 	}
 	defer resp.Body.Close()
 

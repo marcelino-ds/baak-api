@@ -39,7 +39,7 @@ func HandlerHealth(w http.ResponseWriter, r *http.Request) {
 	// Check FlareSolverr if configured
 	fs := utils.GetFlareSolverr()
 	if fs != nil && fs.IsConfigured() {
-		if err := fs.CheckHealth(); err != nil {
+		if err := fs.CheckHealthContext(r.Context()); err != nil {
 			components["flaresolverr"] = ComponentStatus{
 				Status:  "unhealthy",
 				Message: err.Error(),

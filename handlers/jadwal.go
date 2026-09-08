@@ -28,12 +28,17 @@ func HandlerJadwal(w http.ResponseWriter, r *http.Request) {
 		utils.WriteValidationError(w, "Kelas must be at least 3 characters long")
 		return
 	}
+	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
+	if err != nil {
+		utils.WriteInternalServerError(w)
+		return
+	}
 
 	// Fetch CSRF token from the base jadwal page
 	jadwalBaseURL := fmt.Sprintf("%s/jadwal", config.AppConfig.BaseURL)
-	token, err := utils.GetCSRFToken(jadwalBaseURL)
+	token, err := scraper.GetCSRFToken(r.Context(), jadwalBaseURL)
 	if err != nil {
-		utils.WriteErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get CSRF token: %v", err))
+		utils.WriteHTTPError(w, err)
 		return
 	}
 
@@ -44,7 +49,7 @@ func HandlerJadwal(w http.ResponseWriter, r *http.Request) {
 		url.QueryEscape(search),
 	)
 
-	jadwal, err := utils.GetJadwal(searchURL)
+	jadwal, err := scraper.GetJadwal(r.Context(), searchURL)
 	if err != nil {
 		utils.WriteHTTPError(w, err)
 		return
@@ -78,12 +83,17 @@ func HandlerJadwalSearch(w http.ResponseWriter, r *http.Request) {
 		utils.WriteValidationError(w, "Search query must be at least 3 characters long")
 		return
 	}
+	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
+	if err != nil {
+		utils.WriteInternalServerError(w)
+		return
+	}
 
 	// Fetch CSRF token from the base jadwal page
 	jadwalBaseURL := fmt.Sprintf("%s/jadwal", config.AppConfig.BaseURL)
-	token, err := utils.GetCSRFToken(jadwalBaseURL)
+	token, err := scraper.GetCSRFToken(r.Context(), jadwalBaseURL)
 	if err != nil {
-		utils.WriteErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get CSRF token: %v", err))
+		utils.WriteHTTPError(w, err)
 		return
 	}
 
@@ -94,7 +104,7 @@ func HandlerJadwalSearch(w http.ResponseWriter, r *http.Request) {
 		url.QueryEscape(search),
 	)
 
-	jadwal, err := utils.GetJadwal(searchURL)
+	jadwal, err := scraper.GetJadwal(r.Context(), searchURL)
 	if err != nil {
 		utils.WriteHTTPError(w, err)
 		return

@@ -1,7 +1,9 @@
 package utils
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -54,6 +56,14 @@ func WriteInternalServerError(w http.ResponseWriter) {
 
 func WriteHTTPError(w http.ResponseWriter, err error) {
 	message := err.Error()
+	if errors.Is(err, context.DeadlineExceeded) {
+		WriteErrorResponseWithCode(w, http.StatusGatewayTimeout, "The backend server took too long to respond.", "UPSTREAM_TIMEOUT")
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		WriteErrorResponseWithCode(w, http.StatusRequestTimeout, "The request was canceled before the backend response was ready.", "REQUEST_CANCELED")
+		return
+	}
 
 	// Handle Cloudflare-related errors
 	if strings.Contains(message, "access forbidden (403)") ||
@@ -108,4 +118,3 @@ func WriteHTTPError(w http.ResponseWriter, err error) {
 	// Default to internal server error for other cases
 	WriteInternalServerError(w)
 }
-

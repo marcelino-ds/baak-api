@@ -3,13 +3,23 @@ package handlers
 import (
 	"net/http"
 
+	"github.com/yafyx/baak-api/config"
 	"github.com/yafyx/baak-api/utils"
 )
 
 func HandlerKegiatan(w http.ResponseWriter, r *http.Request) {
-	kegiatanList, err := utils.GetKegiatan(utils.BaseURL)
+	if r.Method != http.MethodGet {
+		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		utils.WriteInternalServerError(w)
+		return
+	}
+	kegiatanList, err := scraper.GetKegiatan(r.Context())
+	if err != nil {
+		utils.WriteHTTPError(w, err)
 		return
 	}
 
