@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -28,28 +29,7 @@ func HandlerJadwal(w http.ResponseWriter, r *http.Request) {
 		utils.WriteValidationError(w, "Kelas must be at least 3 characters long")
 		return
 	}
-	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
-	if err != nil {
-		utils.WriteInternalServerError(w)
-		return
-	}
-
-	// Fetch CSRF token from the base jadwal page
-	jadwalBaseURL := fmt.Sprintf("%s/jadwal", config.AppConfig.BaseURL)
-	token, err := scraper.GetCSRFToken(r.Context(), jadwalBaseURL)
-	if err != nil {
-		utils.WriteHTTPError(w, err)
-		return
-	}
-
-	// Construct the search URL with the token
-	searchURL := fmt.Sprintf("%s/jadwal/cariJadKul?_token=%s&teks=%s",
-		config.AppConfig.BaseURL,
-		url.QueryEscape(token),
-		url.QueryEscape(search),
-	)
-
-	jadwal, err := scraper.GetJadwal(r.Context(), searchURL)
+	jadwal, err := getCachedJadwal(r.Context(), search)
 	if err != nil {
 		utils.WriteHTTPError(w, err)
 		return
@@ -83,28 +63,7 @@ func HandlerJadwalSearch(w http.ResponseWriter, r *http.Request) {
 		utils.WriteValidationError(w, "Search query must be at least 3 characters long")
 		return
 	}
-	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
-	if err != nil {
-		utils.WriteInternalServerError(w)
-		return
-	}
-
-	// Fetch CSRF token from the base jadwal page
-	jadwalBaseURL := fmt.Sprintf("%s/jadwal", config.AppConfig.BaseURL)
-	token, err := scraper.GetCSRFToken(r.Context(), jadwalBaseURL)
-	if err != nil {
-		utils.WriteHTTPError(w, err)
-		return
-	}
-
-	// Construct the search URL with the token
-	searchURL := fmt.Sprintf("%s/jadwal/cariJadKul?_token=%s&teks=%s",
-		config.AppConfig.BaseURL,
-		url.QueryEscape(token),
-		url.QueryEscape(search),
-	)
-
-	jadwal, err := scraper.GetJadwal(r.Context(), searchURL)
+	jadwal, err := getCachedJadwal(r.Context(), search)
 	if err != nil {
 		utils.WriteHTTPError(w, err)
 		return
@@ -119,4 +78,32 @@ func HandlerJadwalSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.WriteJSONResponse(w, response)
+}
+
+func getCachedJadwal(ctx context.Context, search string) (models.Jadwal, error) {
+	baseURL := strings.TrimRight(config.AppConfig.BaseURL, "/")
+	key := cacheKey("jadwal", baseURL, search)
+	return cachedValue(
+		ctx,
+		config.AppConfig.CacheEnabled,
+		config.AppConfig.CacheTTLJadwal,
+		key,
+		func(ctx context.Context) (models.Jadwal, error) {
+			scraper, err := utils.NewScraper(baseURL)
+			if err != nil {
+				return models.Jadwal{}, err
+			}
+			jadwalBaseURL := fmt.Sprintf("%s/jadwal", baseURL)
+			token, err := scraper.GetCSRFToken(ctx, jadwalBaseURL)
+			if err != nil {
+				return models.Jadwal{}, err
+			}
+			searchURL := fmt.Sprintf("%s/jadwal/cariJadKul?_token=%s&teks=%s",
+				baseURL,
+				url.QueryEscape(token),
+				url.QueryEscape(search),
+			)
+			return scraper.GetJadwal(ctx, searchURL)
+		},
+	)
 }

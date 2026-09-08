@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
+	"strings"
 
 	"github.com/yafyx/baak-api/config"
+	"github.com/yafyx/baak-api/models"
 	"github.com/yafyx/baak-api/utils"
 )
 
@@ -12,12 +15,21 @@ func HandlerKegiatan(w http.ResponseWriter, r *http.Request) {
 		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
-	if err != nil {
-		utils.WriteInternalServerError(w)
-		return
-	}
-	kegiatanList, err := scraper.GetKegiatan(r.Context())
+	baseURL := strings.TrimRight(config.AppConfig.BaseURL, "/")
+	key := cacheKey("kalender", baseURL)
+	kegiatanList, err := cachedValue(
+		r.Context(),
+		config.AppConfig.CacheEnabled,
+		config.AppConfig.CacheTTLKalender,
+		key,
+		func(ctx context.Context) ([]models.Kegiatan, error) {
+			scraper, err := utils.NewScraper(baseURL)
+			if err != nil {
+				return nil, err
+			}
+			return scraper.GetKegiatan(ctx)
+		},
+	)
 	if err != nil {
 		utils.WriteHTTPError(w, err)
 		return

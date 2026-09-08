@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -13,8 +15,15 @@ type CacheItem struct {
 
 // Cache is a simple in-memory cache with TTL
 type Cache struct {
-	items map[string]CacheItem
-	mutex sync.RWMutex
+	items   map[string]CacheItem
+	loading map[string]*cacheLoad
+	mutex   sync.RWMutex
+}
+
+type cacheLoad struct {
+	done  chan struct{}
+	value interface{}
+	err   error
 }
 
 var (
@@ -59,6 +68,68 @@ func (c *Cache) Get(key string) (interface{}, bool) {
 	}
 
 	return item.Value, true
+}
+
+// GetOrLoad lets concurrent cache misses share one load. A waiting request can
+// cancel independently; a failed load is shared with waiters but never cached.
+func (c *Cache) GetOrLoad(
+	ctx context.Context,
+	key string,
+	ttl time.Duration,
+	load func(context.Context) (interface{}, error),
+) (interface{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ttl <= 0 {
+		return load(ctx)
+	}
+
+	c.mutex.Lock()
+	if item, ok := c.items[key]; ok && time.Now().Before(item.Expiration) {
+		c.mutex.Unlock()
+		return item.Value, nil
+	}
+	if pending, ok := c.loading[key]; ok {
+		c.mutex.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-pending.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return pending.value, pending.err
+		}
+	}
+	if c.loading == nil {
+		c.loading = make(map[string]*cacheLoad)
+	}
+	pending := &cacheLoad{
+		done: make(chan struct{}),
+		err:  errors.New("cache load did not complete"),
+	}
+	c.loading[key] = pending
+	c.mutex.Unlock()
+
+	// Always release waiters, including when the loader panics.
+	defer func() {
+		c.mutex.Lock()
+		delete(c.loading, key)
+		close(pending.done)
+		c.mutex.Unlock()
+	}()
+	value, err := load(ctx)
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		pending.err = err
+		return nil, err
+	}
+	c.Set(key, value, ttl)
+	pending.value, pending.err = value, nil
+	return value, nil
 }
 
 // Delete removes a value from the cache

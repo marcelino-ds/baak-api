@@ -148,6 +148,16 @@ API bisa dikonfigurasi menggunakan environment variables:
 | `CACHE_TTL_KALENDER` | `3600` | TTL cache kalender dalam detik |
 | `CACHE_ENABLED` | `true` | Enable/disable caching |
 
+### Cache Jadwal dan Kalender
+
+- `GET /jadwal/{kelas}` dan `GET /jadwal?q=...` berbagi cache untuk teks pencarian yang sama. TTL default 300 detik (5 menit).
+- `GET /kalender` menggunakan TTL terpisah, default 3600 detik (1 jam).
+- Cache dipisahkan berdasarkan `BASE_URL`; perubahan sumber data tidak memakai hasil dari sumber sebelumnya.
+
+Cache menyimpan hasil parsing yang berhasil, termasuk hasil kosong. Error dan pengambilan yang dibatalkan tidak disimpan. Request bersamaan untuk data yang sama berbagi satu proses pengambilan; TTL dihitung setelah data selesai diambil. Data yang kedaluwarsa diambil ulang saat ada request berikutnya.
+
+`CACHE_ENABLED=false` menonaktifkan pembacaan dan penulisan cache. TTL nol atau negatif menonaktifkan cache untuk endpoint terkait. Konfigurasi dibaca saat startup; restart server setelah mengubah environment variable. Cache hanya ada di memori proses dan kosong kembali setelah restart. Statistik entri tersedia lewat `/health` saat cache aktif.
+
 ## FlareSolverr Setup
 
 FlareSolverr diperlukan untuk melewati proteksi Cloudflare. Jalankan dengan Docker:
