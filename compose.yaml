@@ -1,0 +1,18 @@
+services:
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:v3.5.0
+    ports:
+      - "127.0.0.1:8191:8191"
+    environment:
+      LOG_LEVEL: warning
+      TZ: Asia/Jakarta
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8191/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

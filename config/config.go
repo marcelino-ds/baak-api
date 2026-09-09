@@ -11,6 +11,7 @@ type Config struct {
 	Port             string
 	BaseURL          string
 	RateLimitPerMin  int
+	RateLimitBurst   int
 	AllowedOrigins   []string
 	FlareSolverrURL  string
 	CacheTTLJadwal   time.Duration
@@ -30,7 +31,8 @@ func LoadConfig() {
 	AppConfig = Config{
 		Port:             port,
 		BaseURL:          getEnvOrDefault("BASE_URL", "https://baak.gunadarma.ac.id"),
-		RateLimitPerMin:  getEnvIntOrDefault("RATE_LIMIT_PER_MIN", 60),
+		RateLimitPerMin:  getPositiveIntOrDefault("RATE_LIMIT_PER_MIN", 60),
+		RateLimitBurst:   getPositiveIntOrDefault("RATE_LIMIT_BURST", 10),
 		AllowedOrigins:   getEnvSliceOrDefault("ALLOWED_ORIGINS", []string{"*"}),
 		FlareSolverrURL:  os.Getenv("FLARESOLVERR_URL"),
 		CacheTTLJadwal:   time.Duration(getEnvIntOrDefault("CACHE_TTL_JADWAL", 300)) * time.Second,
@@ -55,6 +57,14 @@ func getEnvIntOrDefault(key string, defaultValue int) int {
 	return defaultValue
 }
 
+func getPositiveIntOrDefault(key string, defaultValue int) int {
+	value := getEnvIntOrDefault(key, defaultValue)
+	if value <= 0 {
+		return defaultValue
+	}
+	return value
+}
+
 func getEnvBoolOrDefault(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		if boolValue, err := strconv.ParseBool(value); err == nil {
@@ -66,8 +76,14 @@ func getEnvBoolOrDefault(key string, defaultValue bool) bool {
 
 func getEnvSliceOrDefault(key string, defaultValue []string) []string {
 	if value := os.Getenv(key); value != "" {
-		return strings.Split(value, ",")
+		origins := make([]string, 0)
+		for _, origin := range strings.Split(value, ",") {
+			origin = strings.TrimSpace(origin)
+			if origin != "" {
+				origins = append(origins, origin)
+			}
+		}
+		return origins
 	}
 	return defaultValue
 }
-

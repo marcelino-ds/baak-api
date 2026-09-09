@@ -92,6 +92,28 @@ func TestConvertWaktuToJam(t *testing.T) {
 	}
 }
 
+func TestParseTanggalHandlesBAAKDateRanges(t *testing.T) {
+	tests := []struct {
+		text  string
+		start string
+		end   string
+	}{
+		{text: "2 Maret \u2013 14 Maret 2026", start: "2 Maret", end: "14 Maret 2026"},
+		{text: "27 Juli \u2013 8 Agustus 2026", start: "27 Juli", end: "8 Agustus 2026"},
+		{text: "2 Maret - 14 Maret 2026", start: "2 Maret", end: "14 Maret 2026"},
+		{text: "2 Maret \u2014 14 Maret 2026", start: "2 Maret", end: "14 Maret 2026"},
+		{text: "16 Mei 2026", start: "16 Mei 2026", end: "16 Mei 2026"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.text, func(t *testing.T) {
+			start, end := parseTanggal(tt.text)
+			if start != tt.start || end != tt.end {
+				t.Errorf("date range = (%q, %q), want (%q, %q)", start, end, tt.start, tt.end)
+			}
+		})
+	}
+}
+
 func TestFetchRejectsCloudflareChallengeWithOKStatus(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<html><title>Just a moment...</title><div id="cf-challenge"></div></html>`))
@@ -111,5 +133,79 @@ func TestFetchRejectsUntrustedTLSCertificate(t *testing.T) {
 
 	if _, err := FetchDocumentWithRetry(upstream.URL, upstream.URL, 1); err == nil {
 		t.Fatal("document fetched using an untrusted TLS certificate")
+	}
+}
+
+func TestParsersRejectPagesWithoutExpectedTables(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html><title>Server Error</title><p>Something went wrong</p></html>`))
+	}))
+	defer upstream.Close()
+	scraper := &Scraper{BaseURL: upstream.URL, client: upstream.Client()}
+
+	parsers := []struct {
+		name string
+		load func() error
+	}{
+		{name: "UTS", load: func() error { _, err := scraper.GetUTS(context.Background(), upstream.URL); return err }},
+		{name: "jadwal", load: func() error { _, err := scraper.GetJadwal(context.Background(), upstream.URL); return err }},
+		{name: "kalender", load: func() error { _, err := scraper.GetKegiatan(context.Background()); return err }},
+		{name: "time slots", load: func() error { _, err := scraper.GetTimeStampLUT(context.Background()); return err }},
+		{name: "kelas baru", load: func() error { _, err := scraper.GetKelasbaru(context.Background(), upstream.URL+"?teks=x"); return err }},
+		{name: "mahasiswa baru", load: func() error {
+			_, err := scraper.GetMahasiswaBaru(context.Background(), upstream.URL+"?teks=x")
+			return err
+		}},
+	}
+	for _, parser := range parsers {
+		t.Run(parser.name, func(t *testing.T) {
+			err := parser.load()
+			if err == nil {
+				t.Fatal("parser accepted a page without a result table")
+			}
+			response := httptest.NewRecorder()
+			WriteHTTPError(response, err)
+			if response.Code != http.StatusBadGateway {
+				t.Errorf("unexpected page status = %d, want 502: %v", response.Code, err)
+			}
+		})
+	}
+}
+
+func TestStudentParsersAcceptExplicitEmptyResults(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html><title>BAAK Online</title>` +
+			`<h5>Input <b>missing</b> Berdasarkan Nama Tidak Ada Dalam Database!</h5></html>`))
+	}))
+	defer upstream.Close()
+	scraper := &Scraper{BaseURL: upstream.URL, client: upstream.Client()}
+	classes, err := scraper.GetKelasbaru(context.Background(), upstream.URL+"?teks=missing")
+	if err != nil || len(classes) != 0 {
+		t.Fatalf("empty class search: %v, %v", classes, err)
+	}
+	students, err := scraper.GetMahasiswaBaru(context.Background(), upstream.URL+"?teks=missing")
+	if err != nil || len(students) != 0 {
+		t.Fatalf("empty student search: %v, %v", students, err)
+	}
+}
+
+func TestJadwalParserAcceptsEmptyTable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/kuliahUjian/6" {
+			_, _ = w.Write([]byte(`<table class="cell-xs-6"><tr><td>Jam ke - 1</td><td>07.30 - 08.30</td></tr></table>`))
+			return
+		}
+		_, _ = w.Write([]byte(`<table><tr><th>KELAS</th><th>HARI</th><th>MATA KULIAH</th>` +
+			`<th>WAKTU</th><th>RUANG</th><th>DOSEN</th></tr></table>`))
+	}))
+	defer upstream.Close()
+	scraper := &Scraper{BaseURL: upstream.URL, client: upstream.Client()}
+	jadwal, err := scraper.GetJadwal(context.Background(), upstream.URL)
+	if err != nil {
+		t.Fatalf("empty schedule: %v", err)
+	}
+	count := len(jadwal.Senin) + len(jadwal.Selasa) + len(jadwal.Rabu) + len(jadwal.Kamis) + len(jadwal.Jumat) + len(jadwal.Sabtu)
+	if count != 0 {
+		t.Fatalf("empty schedule has %d rows", count)
 	}
 }

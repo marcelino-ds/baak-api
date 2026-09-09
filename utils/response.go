@@ -107,6 +107,16 @@ func WriteHTTPError(w http.ResponseWriter, err error) {
 		return
 	}
 
+	if errors.Is(err, ErrUnexpectedPage) {
+		WriteErrorResponseWithCode(
+			w,
+			http.StatusBadGateway,
+			"The backend server returned an unexpected page format.",
+			"UPSTREAM_ERROR",
+		)
+		return
+	}
+
 	// Handle session establishment failures
 	if strings.Contains(message, "failed to establish session") {
 		WriteErrorResponseWithCode(w, http.StatusServiceUnavailable,

@@ -13,7 +13,7 @@ import (
 func TestHandlerJadwalUsesOneSessionForTokenAndSchedule(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/jadwal":
+		case "/":
 			http.SetCookie(w, &http.Cookie{Name: "session", Value: "fixture", Path: "/"})
 			_, _ = w.Write([]byte(`<html><input type="hidden" name="_token" value="fixture-token"></html>`))
 		case "/jadwal/cariJadKul":

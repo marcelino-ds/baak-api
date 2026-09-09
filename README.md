@@ -44,6 +44,7 @@ Mengembalikan status kesehatan API dengan detail komponen:
 
 ```
 GET /jadwal/{kelas}
+GET /jadwal?q={kelas_atau_dosen}
 ```
 
 Mendapatkan informasi jadwal untuk kelas tertentu.
@@ -128,10 +129,27 @@ Error codes:
 - `RATE_LIMITED` - Terlalu banyak request
 - `UPSTREAM_ERROR` - Error dari server BAAK
 - `SESSION_ERROR` - Gagal membuat session
+- `UPSTREAM_TIMEOUT` - Pengambilan data melewati batas waktu request
+- `REQUEST_CANCELED` - Request dibatalkan sebelum pengambilan data selesai
+- `CORS_FORBIDDEN` - Origin preflight tidak diizinkan
+- `CORS_METHOD_FORBIDDEN` - Method preflight tidak diizinkan
+- `CORS_HEADERS_FORBIDDEN` - Header preflight tidak diizinkan
 
 ## Rate Limiting
 
-API ini menggunakan per-IP rate limiting untuk mencegah penyalahgunaan. Default: 5 request per detik dengan burst 10.
+API memakai token bucket per IP. `RATE_LIMIT_PER_MIN` mengatur laju pengisian token,
+default 60 per menit (1 per detik). `RATE_LIMIT_BURST` mengatur jumlah request yang
+bisa diterima sekaligus, default 10. Request saat token habis mendapat HTTP 429
+dengan kode `RATE_LIMITED`. Preflight `OPTIONS` tidak menghabiskan token.
+
+IP diambil dari koneksi langsung (`RemoteAddr`). `X-Forwarded-For` dan `X-Real-IP`
+diabaikan agar client tidak bisa mengganti identitas lewat header. Jika API nanti
+dipasang di belakang reverse proxy, semua client di belakang proxy tersebut akan
+berbagi batas IP proxy sampai dukungan trusted proxy ditambahkan.
+
+Nilai rate dan burst harus bilangan bulat positif; nilai tidak valid memakai
+default. Sebelumnya rate efektif di-hardcode 5 per detik; sekarang default mengikuti
+konfigurasi 60 per menit. Untuk mempertahankan laju lama, set `RATE_LIMIT_PER_MIN=300`.
 
 ## Konfigurasi
 
@@ -141,12 +159,36 @@ API bisa dikonfigurasi menggunakan environment variables:
 |----------|---------|-----------|
 | `PORT` | `:8080` | Port server |
 | `BASE_URL` | `https://baak.gunadarma.ac.id` | URL dasar website BAAK |
-| `RATE_LIMIT_PER_MIN` | `60` | Batas rate per menit (deprecated, now per-IP) |
-| `ALLOWED_ORIGINS` | `*` | Daftar origin CORS yang diizinkan |
+| `RATE_LIMIT_PER_MIN` | `60` | Laju pengisian token per menit per IP |
+| `RATE_LIMIT_BURST` | `10` | Kapasitas burst per IP |
+| `ALLOWED_ORIGINS` | `*` | Origin CORS yang diizinkan, dipisahkan koma |
 | `FLARESOLVERR_URL` | - | URL FlareSolverr (e.g., `http://localhost:8191`) |
 | `CACHE_TTL_JADWAL` | `300` | TTL cache jadwal dalam detik |
 | `CACHE_TTL_KALENDER` | `3600` | TTL cache kalender dalam detik |
 | `CACHE_ENABLED` | `true` | Enable/disable caching |
+
+### CORS Lokal
+
+`ALLOWED_ORIGINS` mencocokkan origin secara utuh, termasuk scheme dan port. Spasi
+di sekitar nilai serta entri kosong diabaikan. `*` mengizinkan semua origin;
+daftar yang hanya berisi spasi atau koma tidak memberi izin ke origin mana pun.
+
+Preflight menerima method `GET` dengan header `Content-Type` dan `Authorization`.
+Preflight yang diizinkan mendapat HTTP 204; origin, method, atau header lain mendapat
+HTTP 403. Request biasa dari origin yang tidak terdaftar tetap diproses tanpa header
+izin CORS, sehingga browser tidak dapat membaca responsnya. CORS bukan autentikasi;
+request tanpa `Origin`, misalnya dari curl, tetap bisa memakai API.
+
+Contoh untuk frontend lokal di PowerShell:
+
+```powershell
+$env:ALLOWED_ORIGINS = "http://localhost:3000,http://localhost:5173"
+$env:RATE_LIMIT_PER_MIN = "60"
+$env:RATE_LIMIT_BURST = "10"
+go run .
+```
+
+Restart server setelah mengubah environment variable.
 
 ### Cache Jadwal dan Kalender
 
@@ -160,26 +202,31 @@ Cache menyimpan hasil parsing yang berhasil, termasuk hasil kosong. Error dan pe
 
 ## FlareSolverr Setup
 
-FlareSolverr diperlukan untuk melewati proteksi Cloudflare. Jalankan dengan Docker:
+FlareSolverr digunakan ketika BAAK menampilkan challenge Cloudflare. Untuk development
+lokal, jalankan service dari `compose.yaml`:
 
 ```bash
-docker run -d \
-  --name flaresolverr \
-  -p 8191:8191 \
-  ghcr.io/flaresolverr/flaresolverr:latest
+docker compose up -d --wait flaresolverr
 ```
 
-Kemudian set environment variable:
+Service memakai FlareSolverr 3.5.0 dan hanya membuka port `127.0.0.1:8191`.
+Log request dinonaktifkan pada level `warning` agar cookie dan token form tidak
+tercetak di log. API Go dijalankan langsung di komputer, terpisah dari container.
 
-```bash
-export FLARESOLVERR_URL=http://localhost:8191
+Di PowerShell:
+
+```powershell
+$env:FLARESOLVERR_URL = "http://127.0.0.1:8191"
+go run .
 ```
+
+Untuk menghentikan FlareSolverr, jalankan `docker compose down`.
 
 ## Development
 
 ### Prasyarat
 
-- Go 1.22 atau lebih tinggi
+- Go 1.23 atau lebih tinggi (`go.mod` memilih toolchain 1.24.1 jika diperlukan)
 - Git
 - Docker (untuk FlareSolverr)
 
@@ -198,17 +245,57 @@ cd baak-api
 go mod download
 ```
 
-3. (Optional) Jalankan FlareSolverr:
+3. Jalankan Docker Desktop dan FlareSolverr:
 
 ```bash
-docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+docker compose up -d --wait flaresolverr
 ```
 
 4. Jalankan server:
 
-```bash
-FLARESOLVERR_URL=http://localhost:8191 go run main.go
+```powershell
+$env:FLARESOLVERR_URL = "http://127.0.0.1:8191"
+go run .
 ```
+
+5. Dari terminal lain, cek API:
+
+```powershell
+Invoke-RestMethod http://localhost:8080/health
+Invoke-RestMethod http://localhost:8080/jadwal/1IA01
+Invoke-RestMethod http://localhost:8080/kalender
+```
+
+Request pertama bisa memerlukan belasan detik untuk menyelesaikan challenge.
+Request jadwal dan kalender berikutnya menggunakan cache selama TTL masih berlaku.
+
+### Hasil Uji Live (9 September 2026)
+
+- Pencarian `1IA01` mengembalikan 14 mata kuliah untuk semester yang tersedia di
+  BAAK, Genap 2025/2026. Token diambil dari form homepage; `/jadwal` pada situs BAAK
+  sendiri mengembalikan halaman 404.
+- Kalender mengembalikan 17 kegiatan. Rentang tanggal dengan tanda pisah pada
+  halaman BAAK dipisahkan menjadi `start` dan `end`.
+- Endpoint UTS di situs BAAK mengembalikan halaman `Server Error`. API merespons
+  HTTP 502 `UPSTREAM_ERROR`; ini tidak dianggap sebagai data kosong yang sukses.
+- Pencarian kelas baru dan mahasiswa baru yang tidak ditemukan menghasilkan
+  HTTP 404 `NOT_FOUND` setelah BAAK menampilkan pesan hasil kosong.
+
+FlareSolverr 3.5.0 dapat melaporkan `solution.status=200` untuk halaman error.
+Parser memeriksa keberadaan tabel yang dibutuhkan. Hasil kosong yang sah tetap
+diterima; halaman tanpa tabel atau pesan hasil kosong dikenali sebagai error.
+`/health` menunjukkan keterjangkauan FlareSolverr dan state circuit breaker,
+bukan jaminan seluruh endpoint BAAK sedang menyediakan data.
+
+### Test
+
+```bash
+go test ./...
+go vet ./...
+```
+
+Test otomatis menggunakan server HTTP dan HTML fixture lokal, sehingga tidak
+memerlukan FlareSolverr atau akses jaringan ke BAAK.
 
 ## Architecture
 

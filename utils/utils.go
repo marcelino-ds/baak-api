@@ -28,6 +28,8 @@ var Limiter = rate.NewLimiter(rate.Limit(5), 10)
 
 const maxHTMLBodyBytes int64 = 8 << 20
 
+var ErrUnexpectedPage = errors.New("upstream response has an unexpected page format")
+
 // Scraper owns the HTTP session for one API request. Keeping the client and
 // cookie jar together makes CSRF and FlareSolverr fallbacks use one session.
 type Scraper struct {
@@ -266,7 +268,11 @@ func (s *Scraper) GetTimeStampLUT(ctx context.Context) ([][]string, error) {
 		return nil, err
 	}
 	result := make([][]string, 0)
-	doc.Find("table.cell-xs-6 tr").Each(func(_ int, row *goquery.Selection) {
+	rows := doc.Find("table.cell-xs-6 tr")
+	if rows.Length() == 0 {
+		return nil, fmt.Errorf("%w: schedule time table is missing", ErrUnexpectedPage)
+	}
+	rows.Each(func(_ int, row *goquery.Selection) {
 		cells := row.Find("td")
 		if cells.Length() < 2 {
 			return
@@ -285,6 +291,10 @@ func (s *Scraper) GetJadwal(ctx context.Context, targetURL string) (models.Jadwa
 	if err != nil {
 		return models.Jadwal{}, err
 	}
+	rows := doc.Find("table").First().Find("tr")
+	if rows.Length() == 0 {
+		return models.Jadwal{}, fmt.Errorf("%w: schedule result table is missing", ErrUnexpectedPage)
+	}
 	lut, err := s.GetTimeStampLUT(ctx)
 	if err != nil {
 		return models.Jadwal{}, err
@@ -294,7 +304,7 @@ func (s *Scraper) GetJadwal(ctx context.Context, targetURL string) (models.Jadwa
 		"Senin": &jadwal.Senin, "Selasa": &jadwal.Selasa, "Rabu": &jadwal.Rabu,
 		"Kamis": &jadwal.Kamis, "Jum'at": &jadwal.Jumat, "Sabtu": &jadwal.Sabtu,
 	}
-	doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+	rows.Each(func(_ int, row *goquery.Selection) {
 		cells := row.Find("td")
 		if cells.Length() < 6 {
 			return
@@ -318,7 +328,11 @@ func (s *Scraper) GetKegiatan(ctx context.Context) ([]models.Kegiatan, error) {
 	}
 	activities := make([]models.Kegiatan, 0)
 	parent := ""
-	doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+	rows := doc.Find("table").First().Find("tr")
+	if rows.Length() == 0 {
+		return nil, fmt.Errorf("%w: academic calendar table is missing", ErrUnexpectedPage)
+	}
+	rows.Each(func(_ int, row *goquery.Selection) {
 		cells := row.Find("td")
 		if cells.Length() != 2 {
 			parent = ""
@@ -347,7 +361,11 @@ func (s *Scraper) GetKelasbaru(ctx context.Context, targetURL string) ([]models.
 		if err != nil {
 			return nil, err
 		}
-		doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+		rows := doc.Find("table").First().Find("tr")
+		if rows.Length() == 0 && !hasEmptySearchResult(doc) {
+			return nil, fmt.Errorf("%w: class result table is missing", ErrUnexpectedPage)
+		}
+		rows.Each(func(_ int, row *goquery.Selection) {
 			cells := row.Find("td")
 			if cells.Length() == 5 {
 				items = append(items, models.KelasBaru{NPM: strings.TrimSpace(cells.Eq(1).Text()), Nama: strings.TrimSpace(cells.Eq(2).Text()), KelasLama: strings.TrimSpace(cells.Eq(3).Text()), KelasBaru: strings.TrimSpace(cells.Eq(4).Text())})
@@ -366,7 +384,11 @@ func (s *Scraper) GetMahasiswaBaru(ctx context.Context, targetURL string) ([]mod
 		if err != nil {
 			return nil, err
 		}
-		doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+		rows := doc.Find("table").First().Find("tr")
+		if rows.Length() == 0 && !hasEmptySearchResult(doc) {
+			return nil, fmt.Errorf("%w: student result table is missing", ErrUnexpectedPage)
+		}
+		rows.Each(func(_ int, row *goquery.Selection) {
 			cells := row.Find("td")
 			if cells.Length() == 6 {
 				items = append(items, models.MahasiswaBaru{NoPend: strings.TrimSpace(cells.Eq(1).Text()), Nama: strings.TrimSpace(cells.Eq(2).Text()), NPM: strings.TrimSpace(cells.Eq(3).Text()), Kelas: strings.TrimSpace(cells.Eq(4).Text()), Keterangan: strings.TrimSpace(cells.Eq(5).Text())})
@@ -378,13 +400,23 @@ func (s *Scraper) GetMahasiswaBaru(ctx context.Context, targetURL string) ([]mod
 	}
 }
 
+func hasEmptySearchResult(doc *goquery.Document) bool {
+	return doc.Find("h5").FilterFunction(func(_ int, heading *goquery.Selection) bool {
+		return strings.HasSuffix(strings.TrimSpace(heading.Text()), "Tidak Ada Dalam Database!")
+	}).Length() > 0
+}
+
 func (s *Scraper) GetUTS(ctx context.Context, targetURL string) ([]models.UTS, error) {
 	doc, err := s.FetchDocument(ctx, targetURL)
 	if err != nil {
 		return nil, err
 	}
 	items := make([]models.UTS, 0)
-	doc.Find("table").First().Find("tr").Each(func(_ int, row *goquery.Selection) {
+	rows := doc.Find("table").First().Find("tr")
+	if rows.Length() == 0 {
+		return nil, fmt.Errorf("%w: UTS result table is missing", ErrUnexpectedPage)
+	}
+	rows.Each(func(_ int, row *goquery.Selection) {
 		cells := row.Find("td")
 		if cells.Length() == 5 {
 			items = append(items, models.UTS{Nama: strings.TrimSpace(cells.Eq(1).Text()), Waktu: strings.TrimSpace(cells.Eq(2).Text()), Ruang: strings.TrimSpace(cells.Eq(3).Text()), Dosen: strings.TrimSpace(cells.Eq(4).Text())})
@@ -428,7 +460,8 @@ func isSubItem(text string) bool {
 }
 
 func parseTanggal(tanggal string) (start, end string) {
-	parts := strings.Split(tanggal, "-")
+	normalized := strings.NewReplacer("\u2013", "-", "\u2014", "-").Replace(tanggal)
+	parts := strings.Split(normalized, "-")
 	if len(parts) == 2 {
 		start = strings.TrimSpace(parts[0])
 		end = strings.TrimSpace(parts[1])

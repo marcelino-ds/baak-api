@@ -93,8 +93,8 @@ func getCachedJadwal(ctx context.Context, search string) (models.Jadwal, error) 
 			if err != nil {
 				return models.Jadwal{}, err
 			}
-			jadwalBaseURL := fmt.Sprintf("%s/jadwal", baseURL)
-			token, err := scraper.GetCSRFToken(ctx, jadwalBaseURL)
+			// BAAK serves the schedule search form on its homepage; /jadwal is a 404.
+			token, err := scraper.GetCSRFToken(ctx, baseURL)
 			if err != nil {
 				return models.Jadwal{}, err
 			}

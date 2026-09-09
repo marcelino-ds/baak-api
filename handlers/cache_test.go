@@ -36,9 +36,6 @@ func newCacheUpstream(t *testing.T) *cacheUpstream {
 			return
 		}
 		switch r.URL.Path {
-		case "/jadwal":
-			http.SetCookie(w, &http.Cookie{Name: "session", Value: "fixture", Path: "/"})
-			_, _ = fmt.Fprint(w, `<input name="_token" value="fixture-token">`)
 		case "/jadwal/cariJadKul":
 			cookie, err := r.Cookie("session")
 			if err != nil || cookie.Value != "fixture" || r.URL.Query().Get("_token") != "fixture-token" {
@@ -53,6 +50,8 @@ func newCacheUpstream(t *testing.T) *cacheUpstream {
 		case "/kuliahUjian/6":
 			_, _ = fmt.Fprint(w, `<table class="cell-xs-6"><tr><td>1</td><td>07.30 - 08.20</td></tr></table>`)
 		case "/":
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: "fixture", Path: "/"})
+			_, _ = fmt.Fprint(w, `<form action="/jadwal/cariJadKul"><input name="_token" value="fixture-token"></form>`)
 			_, _ = fmt.Fprintf(w, `<table><tr><td>Perkuliahan v%d</td><td>9 September 2026</td></tr></table>`,
 				upstream.revision.Load())
 		default:
