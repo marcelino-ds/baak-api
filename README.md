@@ -93,6 +93,18 @@ Parameter:
 
 - `kelas` (path parameter): Kode kelas
 
+### Form pencarian resmi BAAK
+
+API juga mempertahankan kontrak GET yang tampil pada form publik BAAK:
+
+```
+GET /cariKelasBaru?tipeKelasBaru=Kelas|NPM|Nama&teks=...
+GET /cariMhsBaru?tipeMhsBaru=Kelas|Nama&teks=...
+```
+
+Keduanya hanya membaca hasil pencarian dan mengembalikan envelope JSON yang sama
+dengan endpoint `/kelasbaru/{kelas}` dan `/mahasiswabaru/{kelas_atau_nama}`.
+
 ### Informasi Mahasiswa Baru
 
 ```
@@ -134,6 +146,30 @@ Endpoint katalog hanya membaca halaman sumber. Ia tidak melakukan perubahan data
 pengisian KRS, daftar ulang, pengajuan cuti, atau pengajuan ujian bentrok. UAS
 mengikuti formulir BAAK dengan session dan CSRF token, sedangkan Ujian Utama memakai
 parameter `jurusan` yang dipilih BAAK.
+
+### Audit cakupan BAAK (11 September 2026)
+
+Audit browser lokal terhadap navigasi dan enam halaman arsip berita menemukan
+halaman publik berikut: beranda/ringkasan, jadwal kuliah, Ujian Utama, UAS,
+kalender, daftar mata kuliah, dosen wali, koordinator, pembimbing PI, panduan
+jadwal kuliah, jadwal ujian, ujian bentrok, FRS, enam prosedur administrasi,
+berita (36 detail), buku pedoman, arsip kalender, situs resmi, loket, serta form
+pencarian kelas baru dan mahasiswa baru. Semuanya memiliki pemetaan read-only di
+API dan diuji dengan fixture lokal atau parser yang sesuai.
+
+Audit juga menemukan aset publik yang sengaja belum masuk endpoint PDF teks:
+lampiran PDF pada detail berita, formulir administrasi (`.doc` dan PDF), serta
+tautan PDF umum seperti PPSPPT. Endpoint PDF saat ini hanya menerima empat
+katalog resmi (`mata-kuliah`, `buku-pedoman`, `frs`, `kalender`) agar resolusi ID
+tetap terikat katalog dan tidak berubah menjadi downloader URL bebas. Tautan
+tersebut tetap muncul sebagai link publik bila berada di halaman yang dipetakan;
+ekstraksi teksnya memerlukan kategori katalog tambahan yang belum ditetapkan.
+
+`/uts/{kelas}` tetap dipertahankan sebagai kompatibilitas lama, tetapi halaman
+`/jadwal/cariUts` BAAK saat audit mengembalikan Server Error sehingga API
+mengembalikan error upstream, bukan data kosong palsu. Situs eksternal seperti
+RPS, sidang, situs jurusan, ujian, formulir, dan live chat hanya diekspos sebagai
+tautan; API tidak mem-proxy atau meniru aksinya.
 
 Untuk section tabel yang mendukung pencarian, gunakan `q` atau parameter asli BAAK
 (`search_wali`, `search_koor`, `search_pi`) dan `page` 1 sampai 10000. Satu request
@@ -187,6 +223,19 @@ Hasil PDF berupa teks dan tabel umum, belum parser akademik untuk kode mata kuli
 SKS, atau semester. Struktur tabel bergantung tata letak PDF dan perlu diperiksa
 oleh client. PDF scan mungkin tidak memiliki teks, OCR belum tersedia, dan PDF
 yang memerlukan password tidak didukung. Error unduhan/ekstraksi tidak dicache.
+
+### OCR opsional untuk PDF scan
+
+[Baidu Unlimited-OCR](https://github.com/baidu/Unlimited-OCR) secara teknis cocok
+untuk PDF scan: modelnya mendukung multi-halaman dan keluaran markdown. Namun ini
+bukan dependency ringan seperti `pdfplumber`: model BF16 sekitar 3B parameter,
+recipe resmi mencantumkan minimum 8 GB VRAM, image vLLM khusus, `trust_remote_code`,
+custom logits processor, prompt `<image>`, dan konversi PDF ke gambar dengan
+PyMuPDF. Karena itu OCR sebaiknya dijalankan sebagai worker GPU opsional yang
+terpisah, dengan antrean, timeout, batas halaman, dan fallback ke hasil teks
+`pdfplumber`; image API utama tetap tidak mengklaim OCR tersedia. Deployment
+sekarang belum mengaktifkan worker tersebut karena image produksi tidak membawa
+model GPU dan Docker worker lokal belum memiliki runtime NVIDIA yang terverifikasi.
 
 Semua response mengikuti format ini:
 

@@ -16,7 +16,7 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	searchTerm, validationErr := pathSearch(r.URL.Path, "/kelasbaru/")
+	searchTerm, searchTypes, validationErr := kelasBaruSearch(r)
 	if validationErr != nil {
 		utils.WriteValidationError(w, validationErr.Error())
 		return
@@ -27,7 +27,6 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	searchTypes := []string{"Kelas", "NPM", "Nama"}
 	var kelasBaru []models.KelasBaru
 	baseURL := strings.TrimRight(config.AppConfig.BaseURL, "/")
 	kelasBaruBaseURL := fmt.Sprintf("%s/cariKelasBaru", baseURL)
@@ -63,4 +62,23 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.WriteJSONResponse(w, kelasBaru)
+}
+
+func kelasBaruSearch(r *http.Request) (string, []string, error) {
+	if strings.HasPrefix(r.URL.Path, "/kelasbaru/") {
+		searchTerm, err := pathSearch(r.URL.Path, "/kelasbaru/")
+		return searchTerm, []string{"Kelas", "NPM", "Nama"}, err
+	}
+	if r.URL.Path != "/cariKelasBaru" {
+		return "", nil, fmt.Errorf("invalid class search path")
+	}
+	searchTerm, err := querySearch(r.URL.Query().Get("teks"))
+	if err != nil {
+		return "", nil, err
+	}
+	searchType := strings.TrimSpace(r.URL.Query().Get("tipeKelasBaru"))
+	if searchType != "Kelas" && searchType != "NPM" && searchType != "Nama" {
+		return "", nil, fmt.Errorf("tipeKelasBaru must be Kelas, NPM, or Nama")
+	}
+	return searchTerm, []string{searchType}, nil
 }

@@ -105,6 +105,29 @@ func TestPublicRootAliasesReturnSeparateContent(t *testing.T) {
 	}
 }
 
+func TestPublicLoketKeepsTheOfficialSidebarServiceTable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<title>BAAK Online</title><main><div><h3>Kalender Akademik</h3><table>`+
+			`<tr><th>Kegiatan</th><th>Tanggal</th></tr><tr><td>Kuliah</td><td>2 Maret</td></tr></table></div>`+
+			`<aside><h6>Pelayanan di Loket BAAK 1-8</h6><table class="large-only">`+
+			`<tr><th>Hari</th><th>Waktu</th></tr><tr><td>Senin-Kamis</td><td>10.00-15.00 WIB</td></tr>`+
+			`</table></aside></main>`)
+	}))
+	defer server.Close()
+	configureCacheTest(t, server.URL)
+	response := httptest.NewRecorder()
+	HandlerPublic(response, httptest.NewRequest(http.MethodGet, "/public/loket", nil))
+	var result struct {
+		Data models.PublicPage `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || len(result.Data.Tables) != 1 || result.Data.Tables[0].Records[0]["hari"] != "Senin-Kamis" {
+		t.Fatalf("loket sidebar table = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestPublicDocumentCategoryListsDownloads(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/buku_pedoman" {

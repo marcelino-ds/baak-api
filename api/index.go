@@ -125,6 +125,10 @@ func handleRoutes(w http.ResponseWriter, r *http.Request) {
 		handlers.HandlerUTS(w, r)
 	case strings.HasPrefix(r.URL.Path, "/mahasiswabaru/"):
 		handlers.HandlerMahasiswaBaru(w, r)
+	case r.URL.Path == "/cariMhsBaru":
+		handlers.HandlerMahasiswaBaru(w, r)
+	case r.URL.Path == "/cariKelasBaru":
+		handlers.HandlerKelasbaru(w, r)
 	default:
 		utils.WriteNotFoundError(w)
 	}

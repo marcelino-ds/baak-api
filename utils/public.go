@@ -47,7 +47,11 @@ func ParsePublicPage(doc *goquery.Document, source string) (models.PublicPage, e
 		rootLinks = publicLinks(doc.Find("body").First(), base)
 	}
 	scope = scope.Clone()
-	scope.Find("script, style, noscript, iframe, nav, header, footer, aside, input, button, .rd-navbar, .breadcrumb-classic, .resp-tabs-list, .resp-accordion").Remove()
+	remove := "script, style, noscript, iframe, nav, header, footer, input, button, .rd-navbar, .breadcrumb-classic, .resp-tabs-list, .resp-accordion"
+	if base.Path != "/" {
+		remove += ", aside"
+	}
+	scope.Find(remove).Remove()
 	title := cleanPublicText(scope.Find("h1, h2, h3, h4, h5").First().Text())
 	if title == "" {
 		title = pageTitle

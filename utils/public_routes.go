@@ -38,6 +38,7 @@ func PublicCatalog() []models.PublicSection {
 		{ID: "dosen-wali", Name: "Dosen Wali Kelas", Description: "Dosen wali berdasarkan tingkat kelas.", Endpoint: "/dosen-wali/{tingkat}", Methods: []string{"GET"}, Parameter: "tingkat"},
 		{ID: "koordinator", Name: "Koordinator Mata Kuliah", Description: "Koordinator mata kuliah dan kelas.", Endpoint: "/koordinator", Methods: []string{"GET"}},
 		{ID: "pembimbing-pi", Name: "Pembimbing PI", Description: "Dosen pembimbing dan mahasiswa PI.", Endpoint: "/pembimbing-pi", Methods: []string{"GET"}},
+		{ID: "panduan-kuliah", Name: "Panduan Jadwal Kuliah", Description: "Keterangan waktu, lokasi, dan cara membaca jadwal kuliah.", Endpoint: "/panduan-kuliah", Methods: []string{"GET"}},
 		{ID: "jadwal-ujian", Name: "Panduan Jadwal Ujian", Description: "Informasi umum jadwal ujian.", Endpoint: "/jadwal-ujian", Methods: []string{"GET"}},
 		{ID: "ujian-bentrok", Name: "Ujian Bentrok", Description: "Prosedur pengurusan ujian bentrok.", Endpoint: "/ujian-bentrok", Methods: []string{"GET"}},
 		{ID: "frs", Name: "Formulir Rencana Studi", Description: "Panduan FRS/KRS dan dokumen terkait.", Endpoint: "/frs", Methods: []string{"GET"}},
