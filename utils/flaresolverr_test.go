@@ -30,6 +30,17 @@ func TestFlareSolverrAcceptsFractionalCookieExpiry(t *testing.T) {
 	}
 }
 
+func TestFlareSolverrRejectsHTMLFromExternalRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","solution":{"url":"http://127.0.0.1/private","status":200,"response":"<html>private</html>"}}`))
+	}))
+	defer server.Close()
+	fs := &FlareSolverr{url: server.URL, client: server.Client()}
+	if _, err := fs.Fetch("https://baak.example/buku_pedoman"); !errors.Is(err, ErrFlareSolverr) {
+		t.Fatalf("external solver result accepted: %v", err)
+	}
+}
+
 func TestFlareSolverrLimitsConcurrentRequests(t *testing.T) {
 	tests := []struct {
 		value string

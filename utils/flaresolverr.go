@@ -234,6 +234,16 @@ func (fs *FlareSolverr) fetchContext(ctx context.Context, targetURL string, jar 
 		}
 		fsResp = outcome.response
 	}
+	if fsResp.Solution.URL != "" {
+		requested, requestErr := url.Parse(targetURL)
+		resolved, resolveErr := url.Parse(fsResp.Solution.URL)
+		if requestErr != nil || resolveErr != nil {
+			return "", fmt.Errorf("%w: invalid solver result URL", ErrFlareSolverr)
+		}
+		if resolved.User != nil || resolved.Scheme != requested.Scheme || resolved.Host != requested.Host {
+			return "", fmt.Errorf("%w: solver result left the source origin", ErrFlareSolverr)
+		}
+	}
 	// Only an active caller may update its session; the worker never touches the jar.
 	if jar != nil {
 		cookieURL := targetURL

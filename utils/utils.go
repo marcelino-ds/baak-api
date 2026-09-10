@@ -76,6 +76,13 @@ func NewScraper(baseURL string) (*Scraper, error) {
 		}
 		client = proxyClient
 	}
+	base, _ := url.Parse(baseURL)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 || req.URL.User != nil || req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
+			return fmt.Errorf("%w: disallowed source redirect", ErrUnexpectedPage)
+		}
+		return nil
+	}
 	return &Scraper{
 		BaseURL:      baseURL,
 		client:       client,
@@ -110,8 +117,24 @@ func (s *Scraper) ensureClient() error {
 	return nil
 }
 
+func (s *Scraper) validateTargetOrigin(targetURL string) error {
+	if s.BaseURL == "" {
+		return nil
+	}
+	base, baseErr := url.Parse(s.BaseURL)
+	target, targetErr := url.Parse(targetURL)
+	if baseErr != nil || targetErr != nil || target.User != nil ||
+		target.Scheme != base.Scheme || target.Host != base.Host {
+		return fmt.Errorf("%w: target URL is outside the configured origin", ErrUnexpectedPage)
+	}
+	return nil
+}
+
 func (s *Scraper) fetchOnce(ctx context.Context, targetURL, referrer string) (*goquery.Document, error) {
 	if err := s.ensureClient(); err != nil {
+		return nil, err
+	}
+	if err := s.validateTargetOrigin(targetURL); err != nil {
 		return nil, err
 	}
 	parsedURL, err := url.Parse(targetURL)
@@ -326,6 +349,9 @@ func (s *Scraper) fetchFormFlareSolverr(ctx context.Context, targetURL string, v
 
 func (s *Scraper) fetchFormOnce(ctx context.Context, targetURL, referrer string, values url.Values) (*goquery.Document, error) {
 	if err := s.ensureClient(); err != nil {
+		return nil, err
+	}
+	if err := s.validateTargetOrigin(targetURL); err != nil {
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(values.Encode()))

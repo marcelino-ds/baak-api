@@ -81,6 +81,10 @@ func HandlerDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	category := strings.TrimPrefix(r.URL.Path, "/dokumen/")
+	if strings.Contains(category, "/") {
+		HandlerDocumentText(w, r)
+		return
+	}
 	switch category {
 	case "mata-kuliah", "buku-pedoman", "frs", "kalender":
 		handlePublicSection(w, r, "dokumen-"+category, "")
@@ -154,11 +158,32 @@ func handlePublicSection(w http.ResponseWriter, r *http.Request, section, parame
 		utils.WriteInternalServerError(w)
 		return
 	}
+	page, err := loadPublicPage(r.Context(), section, target)
+	if err != nil {
+		utils.WriteHTTPError(w, err)
+		return
+	}
+	utils.WriteJSONResponse(w, page)
+}
+
+func publicTTL(section string) time.Duration {
+	if section == "berita" {
+		return 5 * time.Minute
+	}
+	if strings.HasPrefix(section, "dokumen-") || section == "mata-kuliah" || section == "buku-pedoman" {
+		return time.Hour
+	}
+	return publicPageTTL
+}
+
+func loadPublicPage(ctx context.Context, section, target string) (models.PublicPage, error) {
+	baseURL := strings.TrimRight(config.AppConfig.BaseURL, "/")
+	ttl := publicTTL(section)
 	key := cacheKey("public", section, target)
 	page, err := cachedValue(
-		r.Context(),
+		ctx,
 		config.AppConfig.CacheEnabled,
-		publicPageTTL,
+		ttl,
 		key,
 		func(ctx context.Context) (models.PublicPage, error) {
 			scraper, createErr := utils.NewScraper(baseURL)
@@ -177,15 +202,12 @@ func handlePublicSection(w http.ResponseWriter, r *http.Request, section, parame
 			if err := utils.ValidatePublicTables(&page, section); err != nil {
 				return models.PublicPage{}, err
 			}
+			page = projectPublicPage(section, page)
+			utils.StampPublicPage(&page, ttl)
 			return page, nil
 		},
 	)
-	if err != nil {
-		utils.WriteHTTPError(w, err)
-		return
-	}
-	page = projectPublicPage(section, page)
-	utils.WriteJSONResponse(w, page)
+	return page, err
 }
 
 func projectPublicPage(section string, page models.PublicPage) models.PublicPage {
@@ -332,6 +354,7 @@ func handleUAS(w http.ResponseWriter, r *http.Request, kelas string) {
 			if err := utils.ValidatePublicTables(&page, "uas"); err != nil {
 				return models.PublicPage{}, err
 			}
+			utils.StampPublicPage(&page, publicPageTTL)
 			return page, nil
 		},
 	)

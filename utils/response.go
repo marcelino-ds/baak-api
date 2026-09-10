@@ -90,6 +90,16 @@ func WriteHTTPError(w http.ResponseWriter, err error) {
 	}
 	var upstreamStatus upstreamStatusError
 	switch {
+	case errors.Is(err, ErrPDFUnavailable):
+		WriteErrorResponseWithCode(w, http.StatusServiceUnavailable, "PDF extraction runtime is unavailable.", "PDF_UNAVAILABLE")
+		return
+	case errors.Is(err, ErrPDFBusy):
+		w.Header().Set("Retry-After", "2")
+		WriteErrorResponseWithCode(w, http.StatusServiceUnavailable, "PDF extraction capacity is full.", "PDF_BUSY")
+		return
+	case errors.Is(err, ErrPDFInvalid):
+		WriteErrorResponseWithCode(w, http.StatusUnprocessableEntity, "The document is not a supported PDF or exceeds extraction limits.", "PDF_UNSUPPORTED")
+		return
 	case errors.Is(err, ErrCircuitOpen):
 		w.Header().Set("Retry-After", "30")
 		WriteErrorResponseWithCode(w, http.StatusServiceUnavailable, "Service temporarily unavailable while the upstream recovers.", "CIRCUIT_OPEN")

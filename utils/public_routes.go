@@ -43,6 +43,7 @@ func PublicCatalog() []models.PublicSection {
 		{ID: "frs", Name: "Formulir Rencana Studi", Description: "Panduan FRS/KRS dan dokumen terkait.", Endpoint: "/frs", Methods: []string{"GET"}},
 		{ID: "berita", Name: "Berita BAAK", Description: "Daftar dan detail berita BAAK.", Endpoint: "/berita[/{id}]", Methods: []string{"GET"}, Parameter: "id"},
 		{ID: "buku-pedoman", Name: "Buku Pedoman", Description: "Daftar dokumen pedoman resmi.", Endpoint: "/buku-pedoman", Methods: []string{"GET"}},
+		{ID: "dokumen-teks", Name: "Teks Dokumen", Description: "Ekstraksi teks dan tabel dari dokumen PDF resmi.", Endpoint: "/dokumen/{kategori}/{id}/teks", Methods: []string{"GET"}, Parameter: "kategori,id"},
 		{ID: "layanan", Name: "Layanan Administrasi", Description: "Syarat dan prosedur layanan administrasi publik.", Endpoint: "/layanan/{slug}", Methods: []string{"GET"}, Parameter: "slug"},
 		{ID: "situs", Name: "Situs Resmi", Description: "Tautan RPS, sidang, dan situs jurusan.", Endpoint: "/situs", Methods: []string{"GET"}},
 		{ID: "loket", Name: "Jam Loket BAAK", Description: "Jam pelayanan loket BAAK.", Endpoint: "/loket", Methods: []string{"GET"}},

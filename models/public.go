@@ -5,6 +5,7 @@ type PublicLink struct {
 	Text string `json:"text"`
 	URL  string `json:"url"`
 	Kind string `json:"kind,omitempty"`
+	ID   string `json:"id,omitempty"`
 }
 
 // PublicTable is a normalized HTML table from a public BAAK page.
@@ -54,4 +55,6 @@ type PublicPage struct {
 	Options    map[string][]PublicOption `json:"options,omitempty"`
 	News       []NewsItem                `json:"news,omitempty"`
 	Pagination Pagination                `json:"pagination"`
+	Article    *NewsArticle              `json:"article,omitempty"`
+	Metadata   *SourceMetadata           `json:"metadata,omitempty"`
 }

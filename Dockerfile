@@ -7,7 +7,9 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o baak-api .
 
 FROM builder AS test
-RUN apk add --no-cache gcc musl-dev
+RUN apk add --no-cache gcc musl-dev python3 py3-pip
+RUN python3 -m venv /opt/pdf && /opt/pdf/bin/pip install --no-cache-dir pdfplumber==0.11.9
+ENV PDF_PYTHON=/opt/pdf/bin/python
 RUN CGO_ENABLED=1 go test -race -count=1 ./... && go vet ./...
 
 # Final image with FlareSolverr + BAAK API
@@ -16,6 +18,8 @@ FROM ghcr.io/flaresolverr/flaresolverr:v3.5.0
 # Install supervisor to run multiple processes
 USER root
 RUN apt-get update && apt-get install -y supervisor && rm -rf /var/lib/apt/lists/*
+RUN /usr/local/bin/python -m pip install --no-cache-dir pdfplumber==0.11.9
+ENV PDF_PYTHON=/usr/local/bin/python
 
 # Copy BAAK API binary
 COPY --from=builder /app/baak-api /usr/local/bin/baak-api

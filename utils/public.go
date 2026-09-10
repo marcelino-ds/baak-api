@@ -34,6 +34,10 @@ func ParsePublicPage(doc *goquery.Document, source string) (models.PublicPage, e
 	if isPublicErrorPage(pageTitle) {
 		return models.PublicPage{}, errPublicPage
 	}
+	article, err := parseNewsArticle(doc, base)
+	if err != nil {
+		return models.PublicPage{}, err
+	}
 	scope := publicScope(doc, base.Path)
 	if scope == nil {
 		return models.PublicPage{}, errPublicPage
@@ -53,11 +57,16 @@ func ParsePublicPage(doc *goquery.Document, source string) (models.PublicPage, e
 		return models.PublicPage{}, errPublicPage
 	}
 	page := models.PublicPage{
+		Article: article,
 		Section: publicSectionForPath(base.Path),
 		Path:    base.Path, Source: safePublicURL(base, source), Title: title, Text: text,
 		Links: publicLinks(scope, base), Tables: make([]models.PublicTable, 0),
 		Options: make(map[string][]models.PublicOption), News: publicNews(scope, base),
 		Pagination: publicPagination(scope, base),
+	}
+	if article != nil {
+		page.Title = article.Title
+		page.Text = article.Content
 	}
 	if base.Path == "/" {
 		page.Links = rootLinks
@@ -251,7 +260,11 @@ func publicLinks(scope *goquery.Selection, base *url.URL) []models.PublicLink {
 		if label == "" {
 			label = path.Base(u.Path)
 		}
-		links = append(links, models.PublicLink{Text: label, URL: resolved, Kind: kind})
+		entry := models.PublicLink{Text: label, URL: resolved, Kind: kind}
+		if kind == "document" {
+			entry.ID = DocumentID(resolved)
+		}
+		links = append(links, entry)
 	})
 	return links
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/yafyx/baak-api/config"
 	"github.com/yafyx/baak-api/models"
@@ -47,6 +48,16 @@ func TestHandlerUASUsesPublicPOSTContract(t *testing.T) {
 	HandlerPublicAlias("uas")(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Algoritma") {
 		t.Fatalf("UAS response = %d %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data models.PublicPage `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	metadata := envelope.Data.Metadata
+	if metadata == nil || metadata.FetchedAt.IsZero() || metadata.ExpiresAt.Sub(metadata.FetchedAt) != 10*time.Minute {
+		t.Fatalf("UAS freshness = %+v", metadata)
 	}
 }
 

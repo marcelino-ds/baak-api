@@ -126,6 +126,7 @@ bersifat read-only dan mengembalikan JSON terstandardisasi dengan `title`, `text
 - `/ujian-bentrok` dan `/frs` - Prosedur publik dan dokumen terkait
 - `/berita` atau `/berita/{id}` - Daftar/detail berita BAAK
 - `/buku-pedoman` - Daftar buku pedoman dan tautan dokumen
+- `/dokumen/{kategori}/{id}/teks` - Teks, tabel, halaman, dan metadata PDF; `id` berasal dari `id` pada link katalog
 - `/layanan/{slug}` - `daftar-ulang`, `cuti`, `nonaktif`, `pengecekan-nilai`, `pindah-lokasi`, `pindah-jurusan`
 - `/situs` dan `/loket` - Tautan situs resmi dan jam pelayanan loket
 
@@ -139,7 +140,53 @@ Untuk section tabel yang mendukung pencarian, gunakan `q` atau parameter asli BA
 mengambil satu halaman sumber, sehingga seluruh daftar PI tetap dapat diakses. Contoh:
 `/koordinator?q=algoritma&page=2`. UAS menerima `/uas/1IA01` atau `/uas?q=1IA01`.
 
+Ekstraksi PDF dibatasi 16 MiB input, 100 halaman, 1.000.000 karakter gabungan teks
+dan sel tabel, serta 4 MiB output JSON worker. Batas waktu unduhan 15 detik dan
+subprocess 20 detik, dengan maksimal dua ekstraksi bersamaan per proses API.
+Worker Linux juga membatasi ruang alamat 512 MiB dan waktu CPU 15 detik; batas
+memori ini tidak tersedia di Windows. Batas request API keseluruhan tetap 50 detik.
+Dokumen hanya boleh berasal dari URL resmi BAAK yang muncul di katalog; endpoint
+menolak URL eksternal, redirect keluar, HTML, dan dokumen rusak.
+
+Respons halaman publik memiliki metadata `fetched_at`, `expires_at`, dan
+`content_hash` di dalam `data.metadata`. Berita memakai TTL 5 menit, katalog dokumen
+1 jam, hasil ekstraksi PDF 24 jam, dan section `PublicPage` lainnya 10 menit.
+Envelope dan endpoint lama dipertahankan; respons legacy seperti `/jadwal` dan
+`/kalender` tetap memakai format dan konfigurasi TTL sebelumnya.
+Hash halaman dihitung dari data hasil parsing tanpa metadata waktu; hash PDF dari
+byte PDF sumber. ID dokumen adalah SHA-256 URL, sehingga berbeda dari hash isi PDF.
+Detail berita menyertakan `article` dengan ID, judul, tanggal ISO (kosong bila
+tanggal sumber tidak dikenali), penulis, isi, dan
+lampiran. PDF berbasis scan akan mengembalikan warning bila teks tidak dapat
+diekstrak; OCR tidak dijalankan otomatis.
+
 ## Format Response
+
+Untuk development ekstraksi PDF, install `pdfplumber==0.11.9` pada Python yang
+ditunjuk `PDF_PYTHON`. Dockerfile memasang versi yang sama. Binary Go meng-embed
+script worker, tetapi tetap memerlukan Python dan pdfplumber; deployment yang
+tidak menyediakannya mengembalikan HTTP 503 `PDF_UNAVAILABLE`. Contoh alur:
+
+1. Ambil `/dokumen/buku-pedoman`, pilih `data.links[].id` untuk tautan PDF.
+2. Panggil `/dokumen/buku-pedoman/{id}/teks`.
+3. Baca `data.pages[].text` dan `data.pages[].tables`; periksa `data.warnings`.
+
+Metadata menunjukkan waktu pengambilan sumber, bukan tanggal perubahan resmi BAAK.
+`expires_at` adalah batas freshness berdasarkan TTL, bukan jaminan sumber belum
+berubah. Saat cache dinonaktifkan, metadata tetap diberikan pada setiap fetch.
+Cache diperbarui saat TTL habis dan request berikutnya masuk; tidak ada polling
+otomatis atau endpoint publik penghapusan cache. PDF yang diblokir Cloudflare tetap
+menghasilkan error sumber karena FlareSolverr tidak menyediakan unduhan PDF biner.
+Katalog tetap diperiksa sebelum hasil ekstraksi diberikan, termasuk saat PDF
+masih ada di cache. Hanya path `/file/*.pdf` (termasuk subdirektori) dan
+`/downloadAkademik/{id_numerik}` pada origin `BASE_URL` yang boleh diunduh; maksimal
+dua redirect yang tetap memenuhi aturan tersebut. URL bebas, query unduhan,
+path traversal, dan origin lain ditolak.
+
+Hasil PDF berupa teks dan tabel umum, belum parser akademik untuk kode mata kuliah,
+SKS, atau semester. Struktur tabel bergantung tata letak PDF dan perlu diperiksa
+oleh client. PDF scan mungkin tidak memiliki teks, OCR belum tersedia, dan PDF
+yang memerlukan password tidak didukung. Error unduhan/ekstraksi tidak dicache.
 
 Semua response mengikuti format ini:
 
@@ -208,6 +255,7 @@ API bisa dikonfigurasi menggunakan environment variables:
 | `ALLOWED_ORIGINS` | `*` | Origin CORS yang diizinkan, dipisahkan koma |
 | `FLARESOLVERR_URL` | - | URL FlareSolverr (e.g., `http://localhost:8191`) |
 | `FLARESOLVERR_MAX_CONCURRENT` | `2` | Jumlah request FlareSolverr aktif per proses |
+| `PDF_PYTHON` | `python3` | Executable Python untuk ekstraksi PDF (`pdfplumber` diperlukan) |
 | `CACHE_TTL_JADWAL` | `300` | TTL cache jadwal dalam detik |
 | `CACHE_TTL_KALENDER` | `3600` | TTL cache kalender dalam detik |
 | `CACHE_ENABLED` | `true` | Enable/disable caching |
@@ -377,8 +425,10 @@ go test ./...
 go vet ./...
 ```
 
-Test otomatis menggunakan server HTTP dan HTML fixture lokal, sehingga tidak
-memerlukan FlareSolverr atau akses jaringan ke BAAK.
+Test otomatis menggunakan server HTTP, HTML fixture lokal, dan PDF buatan test.
+Test ekstraksi dan integrasi endpoint menjalankan Python/pdfplumber asli; install
+`pdfplumber==0.11.9` dan atur `PDF_PYTHON` jika executable bukan `python3`.
+Test lokal ini tidak memerlukan FlareSolverr atau akses jaringan ke BAAK.
 
 Untuk memeriksa akses memori bersama dengan race detector di Linux:
 

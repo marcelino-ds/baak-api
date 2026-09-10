@@ -83,6 +83,8 @@ func TestAllrounderDiscoveryAndValidationRoutes(t *testing.T) {
 		{path: "/layanan", status: 200, contains: "pindah-jurusan"},
 		{path: "/ktm/", status: 400, contains: "VALIDATION_ERROR"},
 		{path: "/dokumen/unknown", status: 404, contains: "NOT_FOUND"},
+		{path: "/dokumen/buku-pedoman/not-a-hash/teks", status: 400, contains: "VALIDATION_ERROR"},
+		{path: "/dokumen/buku-pedoman/id/unknown", status: 404, contains: "NOT_FOUND"},
 	}
 	for _, tt := range tests {
 		response := httptest.NewRecorder()
