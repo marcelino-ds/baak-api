@@ -319,9 +319,9 @@ func (s *Scraper) GetJadwal(ctx context.Context, targetURL string) (models.Jadwa
 	if err != nil {
 		return models.Jadwal{}, err
 	}
-	rows := doc.Find("table").First().Find("tr")
-	if rows.Length() == 0 {
-		return models.Jadwal{}, fmt.Errorf("%w: schedule result table is missing", ErrUnexpectedPage)
+	table, err := findJadwalTable(doc)
+	if err != nil {
+		return models.Jadwal{}, err
 	}
 	lut, err := s.GetTimeStampLUT(ctx)
 	if err != nil {
@@ -332,20 +332,37 @@ func (s *Scraper) GetJadwal(ctx context.Context, targetURL string) (models.Jadwa
 		"Senin": &jadwal.Senin, "Selasa": &jadwal.Selasa, "Rabu": &jadwal.Rabu,
 		"Kamis": &jadwal.Kamis, "Jum'at": &jadwal.Jumat, "Sabtu": &jadwal.Sabtu,
 	}
-	rows.Each(func(_ int, row *goquery.Selection) {
-		cells := row.Find("td")
-		if cells.Length() < 6 {
-			return
+	var parseErr error
+	table.rows.EachWithBreak(func(_ int, row *goquery.Selection) bool {
+		cells := row.ChildrenFiltered("th, td")
+		if cells.Length() == 0 || len(jadwalColumns(cells)) == 6 {
+			return true
+		}
+		for _, index := range table.columns {
+			if index >= cells.Length() {
+				parseErr = fmt.Errorf("%w: schedule row is missing columns", ErrUnexpectedPage)
+				return false
+			}
+		}
+		text := func(name string) string { return strings.TrimSpace(cells.Eq(table.columns[name]).Text()) }
+		day, ok := hariMap[text("HARI")]
+		if !ok {
+			parseErr = fmt.Errorf("%w: schedule row has an unrecognized day", ErrUnexpectedPage)
+			return false
 		}
 		course := models.MataKuliah{
-			Nama: strings.TrimSpace(cells.Eq(2).Text()), Waktu: strings.TrimSpace(cells.Eq(3).Text()),
-			Jam:   convertWaktuToJam(strings.TrimSpace(cells.Eq(3).Text()), lut),
-			Ruang: strings.TrimSpace(cells.Eq(4).Text()), Dosen: strings.TrimSpace(cells.Eq(5).Text()),
+			Nama:  text("MATAKULIAH"),
+			Waktu: text("WAKTU"),
+			Jam:   convertWaktuToJam(text("WAKTU"), lut),
+			Ruang: text("RUANG"),
+			Dosen: text("DOSEN"),
 		}
-		if day, ok := hariMap[strings.TrimSpace(cells.Eq(1).Text())]; ok {
-			*day = append(*day, course)
-		}
+		*day = append(*day, course)
+		return true
 	})
+	if parseErr != nil {
+		return models.Jadwal{}, parseErr
+	}
 	return jadwal, nil
 }
 

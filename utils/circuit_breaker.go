@@ -124,7 +124,8 @@ func (cb *CircuitBreaker) Execute(operation func() error) (err error) {
 		if generation != cb.generation {
 			return
 		}
-		if errors.Is(err, context.Canceled) {
+		// Requests rejected locally provide no evidence about dependency health.
+		if errors.Is(err, context.Canceled) || errors.Is(err, ErrFlareSolverrBusy) {
 			cb.halfOpenProbe = false
 			return
 		}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yafyx/baak-api/config"
@@ -52,6 +54,39 @@ type FlareSolverr struct {
 	client *http.Client
 }
 
+const flareSolverrTimeout = 65 * time.Second
+
+var ErrFlareSolverrBusy = errors.New("FlareSolverr concurrency limit reached")
+
+var flareConcurrency struct {
+	sync.Mutex
+	active int
+}
+
+func acquireFlareSolverrSlot(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	limit := config.AppConfig.FlareSolverrMaxConcurrent
+	if limit <= 0 {
+		limit = config.DefaultFlareSolverrMaxConcurrent
+	}
+	flareConcurrency.Lock()
+	defer flareConcurrency.Unlock()
+	if flareConcurrency.active >= limit {
+		return nil, ErrFlareSolverrBusy
+	}
+	flareConcurrency.active++
+	return func() {
+		flareConcurrency.Lock()
+		flareConcurrency.active--
+		flareConcurrency.Unlock()
+	}, nil
+}
+
 // GetFlareSolverr returns the FlareSolverr instance if configured
 func GetFlareSolverr() *FlareSolverr {
 	url := config.AppConfig.FlareSolverrURL
@@ -66,10 +101,11 @@ func GetFlareSolverr() *FlareSolverr {
 
 var flareClient = func() *http.Client {
 	transport := newTransport()
-	transport.MaxConnsPerHost = 2
+	// The shared request limiter also covers HTTP/2; avoid a second transport queue.
+	transport.MaxConnsPerHost = 0
 	transport.MaxIdleConnsPerHost = 2
-	transport.ResponseHeaderTimeout = 65 * time.Second
-	return &http.Client{Timeout: 65 * time.Second, Transport: transport}
+	transport.ResponseHeaderTimeout = flareSolverrTimeout
+	return &http.Client{Timeout: flareSolverrTimeout, Transport: transport}
 }()
 
 var flareHealthClient = &http.Client{Timeout: config.HealthTimeout, Transport: directTransport}
@@ -91,6 +127,9 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	}
 	if fs == nil || fs.url == "" {
 		return "", fmt.Errorf("FlareSolverr not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	client := fs.client
 	if client == nil {
@@ -127,40 +166,58 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fs.url+"/v1", bytes.NewBuffer(jsonBody))
+	// A caller disconnect does not stop FlareSolverr's browser. Keep observing
+	// the job with its own timeout so cancellation cannot free capacity early.
+	solverCtx, cancelSolver := context.WithTimeout(context.WithoutCancel(ctx), flareSolverrTimeout)
+	req, err := http.NewRequestWithContext(
+		solverCtx,
+		http.MethodPost,
+		fs.url+"/v1",
+		bytes.NewReader(jsonBody),
+	)
 	if err != nil {
+		cancelSolver()
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
+	release, err := acquireFlareSolverrSlot(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%w: HTTP status %d", ErrFlareSolverr, resp.StatusCode)
+		cancelSolver()
+		return "", err
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTMLBodyBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+	type result struct {
+		response FlareSolverrResponse
+		err      error
 	}
-	if int64(len(body)) > maxHTMLBodyBytes {
-		return "", fmt.Errorf("FlareSolverr response exceeds size limit")
-	}
+	completed := make(chan result, 1)
+	go func() {
+		outcome := result{err: fmt.Errorf("%w: solver request did not complete", ErrFlareSolverr)}
+		defer func() {
+			if recover() != nil {
+				outcome.err = fmt.Errorf("%w: unexpected solver request failure", ErrFlareSolverr)
+			}
+			cancelSolver()
+			release()
+			completed <- outcome
+		}()
+		outcome.response, outcome.err = fetchFlareSolverrResponse(client, req)
+	}()
 
 	var fsResp FlareSolverrResponse
-	if err := json.Unmarshal(body, &fsResp); err != nil {
-		return "", fmt.Errorf("failed to unmarshal response: %v", err)
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case outcome := <-completed:
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if outcome.err != nil {
+			return "", outcome.err
+		}
+		fsResp = outcome.response
 	}
-
-	if fsResp.Status != "ok" {
-		return "", fmt.Errorf("%w: solver rejected the request", ErrFlareSolverr)
-	}
-	if fsResp.Solution.Status != http.StatusOK {
-		return "", upstreamStatusError{code: fsResp.Solution.Status}
-	}
+	// Only an active caller may update its session; the worker never touches the jar.
 	if jar != nil {
 		cookieURL := targetURL
 		if fsResp.Solution.URL != "" {
@@ -182,6 +239,36 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	}
 
 	return fsResp.Solution.Response, nil
+}
+
+func fetchFlareSolverrResponse(client *http.Client, req *http.Request) (FlareSolverrResponse, error) {
+	var result FlareSolverrResponse
+	resp, err := client.Do(req)
+	if err != nil {
+		return result, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return result, fmt.Errorf("%w: HTTP status %d", ErrFlareSolverr, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTMLBodyBytes+1))
+	if err != nil {
+		return result, fmt.Errorf("failed to read response: %w", err)
+	}
+	if int64(len(body)) > maxHTMLBodyBytes {
+		return result, fmt.Errorf("%w: response exceeds size limit", ErrFlareSolverr)
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return result, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	if result.Status != "ok" {
+		return result, fmt.Errorf("%w: solver rejected the request", ErrFlareSolverr)
+	}
+	if result.Solution.Status != http.StatusOK {
+		return result, upstreamStatusError{code: result.Solution.Status}
+	}
+	return result, nil
 }
 
 // CheckHealth checks if FlareSolverr is reachable and working

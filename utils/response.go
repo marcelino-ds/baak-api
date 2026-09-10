@@ -53,6 +53,7 @@ func writeResponse(w http.ResponseWriter, status int, response Response) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_, _ = w.Write(append(body, '\n'))
 }
@@ -107,6 +108,15 @@ func WriteHTTPError(w http.ResponseWriter, err error) {
 		default:
 			WriteErrorResponseWithCode(w, http.StatusBadGateway, "The backend server returned an unsuccessful response.", "UPSTREAM_ERROR")
 		}
+		return
+	case errors.Is(err, ErrFlareSolverrBusy):
+		w.Header().Set("Retry-After", "1")
+		WriteErrorResponseWithCode(
+			w,
+			http.StatusServiceUnavailable,
+			"FlareSolverr is busy. Please try again shortly.",
+			"FLARESOLVERR_BUSY",
+		)
 		return
 	case errors.Is(err, ErrFlareSolverr):
 		WriteErrorResponseWithCode(w, http.StatusBadGateway, "FlareSolverr could not complete the request.", "FLARESOLVERR_ERROR")

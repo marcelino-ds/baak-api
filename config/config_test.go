@@ -2,8 +2,45 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestConfigValidatesTrustedProxies(t *testing.T) {
+	tests := []struct {
+		value string
+		valid bool
+	}{
+		{value: "", valid: true},
+		{value: " 127.0.0.1, 10.2.3.0/24, ::1, 2001:db8::/32 ", valid: true},
+		{value: "::ffff:192.0.2.0/120", valid: true},
+		{value: "*"},
+		{value: "proxy.example"},
+		{value: "192.0.2.1:8080"},
+		{value: "192.0.2.0/99"},
+		{value: "fe80::1%eth0"},
+		{value: "::ffff:192.0.2.0/80"},
+		{value: "192.0.2.0/24,invalid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			restoreConfig(t)
+			t.Setenv("TRUSTED_PROXIES", tt.value)
+			t.Setenv("PORT", "8080")
+			t.Setenv("BASE_URL", "https://baak.example")
+			t.Setenv("FLARESOLVERR_URL", "")
+			t.Setenv("HTTP_PROXIES", "")
+			LoadConfig()
+			err := AppConfig.Validate()
+			if (err == nil) != tt.valid {
+				t.Fatalf("Validate() = %v, valid = %t", err, tt.valid)
+			}
+			if err != nil && !strings.Contains(err.Error(), "TRUSTED_PROXIES") {
+				t.Fatalf("error does not identify invalid setting: %v", err)
+			}
+		})
+	}
+}
 
 func restoreConfig(t *testing.T) {
 	t.Helper()
@@ -56,6 +93,19 @@ func TestLoadConfigFallsBackForInvalidRateLimit(t *testing.T) {
 			LoadConfig()
 			if AppConfig.RateLimitPerMin != 60 || AppConfig.RateLimitBurst != 10 {
 				t.Fatalf("invalid rate config: rate=%d, burst=%d", AppConfig.RateLimitPerMin, AppConfig.RateLimitBurst)
+			}
+		})
+	}
+}
+
+func TestLoadConfigFallsBackForInvalidFlareSolverrConcurrency(t *testing.T) {
+	for _, value := range []string{"", "not-a-number", "0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			restoreConfig(t)
+			t.Setenv("FLARESOLVERR_MAX_CONCURRENT", value)
+			LoadConfig()
+			if AppConfig.FlareSolverrMaxConcurrent != DefaultFlareSolverrMaxConcurrent {
+				t.Fatalf("invalid FlareSolverr concurrency = %d, want %d", AppConfig.FlareSolverrMaxConcurrent, DefaultFlareSolverrMaxConcurrent)
 			}
 		})
 	}

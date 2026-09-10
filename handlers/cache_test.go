@@ -20,9 +20,10 @@ import (
 
 type cacheUpstream struct {
 	*httptest.Server
-	requests atomic.Int64
-	blocked  atomic.Bool
-	revision atomic.Int64
+	requests          atomic.Int64
+	blocked           atomic.Bool
+	revision          atomic.Int64
+	malformedSchedule atomic.Bool
 }
 
 func newCacheUpstream(t *testing.T) *cacheUpstream {
@@ -42,8 +43,14 @@ func newCacheUpstream(t *testing.T) *cacheUpstream {
 				http.Error(w, "invalid session", http.StatusForbidden)
 				return
 			}
+			if upstream.malformedSchedule.Load() {
+				_, _ = fmt.Fprint(w, `<table><tr><td>Portal navigation</td></tr></table>`)
+				return
+			}
 			_, _ = fmt.Fprintf(w,
-				`<table><tr><td>1</td><td>Senin</td><td>Algoritma %s v%d</td>`+
+				`<table><tr><th>KELAS</th><th>HARI</th><th>MATA KULIAH</th>`+
+					`<th>WAKTU</th><th>RUANG</th><th>DOSEN</th></tr>`+
+					`<tr><td>1</td><td>Senin</td><td>Algoritma %s v%d</td>`+
 					`<td>1</td><td>D201</td><td>Dr. Ada</td></tr></table>`,
 				html.EscapeString(r.URL.Query().Get("teks")), upstream.revision.Load(),
 			)
@@ -60,6 +67,33 @@ func newCacheUpstream(t *testing.T) *cacheUpstream {
 	}))
 	t.Cleanup(upstream.Close)
 	return upstream
+}
+
+func TestJadwalCacheDoesNotStoreUnexpectedTable(t *testing.T) {
+	for _, endpoint := range cachedEndpoints[:2] {
+		t.Run(endpoint.name, func(t *testing.T) {
+			upstream := newCacheUpstream(t)
+			configureCacheTest(t, upstream.URL)
+			upstream.malformedSchedule.Store(true)
+			response := endpoint.get(t)
+			if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "UPSTREAM_ERROR") {
+				t.Fatalf("unexpected table response = %d %s", response.Code, response.Body.String())
+			}
+			if items := utils.GetCache().Stats().TotalItems; items != 0 {
+				t.Fatalf("unexpected table populated %d cache entries", items)
+			}
+			upstream.malformedSchedule.Store(false)
+			response = endpoint.get(t)
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Algoritma 1IA01") {
+				t.Fatalf("valid response was replaced with cached empty result: %d %s", response.Code, response.Body.String())
+			}
+			upstream.blocked.Store(true)
+			cached := endpoint.get(t)
+			if cached.Code != http.StatusOK || cached.Body.String() != response.Body.String() {
+				t.Fatalf("valid result not cached: %d %s", cached.Code, cached.Body.String())
+			}
+		})
+	}
 }
 
 func configureCacheTest(t *testing.T, baseURL string) {

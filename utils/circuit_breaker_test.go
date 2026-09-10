@@ -3,10 +3,39 @@ package utils
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestLocalSolverOverloadDoesNotChangeDependencyFailures(t *testing.T) {
+	cb := NewCircuitBreaker()
+	cb.RecordFailure()
+	for range 10 {
+		err := cb.Execute(func() error { return fmt.Errorf("%w: %w", ErrFlareSolverr, ErrFlareSolverrBusy) })
+		if !errors.Is(err, ErrFlareSolverrBusy) {
+			t.Fatalf("local capacity error opened circuit: %v", err)
+		}
+	}
+	if stats := cb.Stats(); stats.Failures != 1 || cb.State() != CircuitClosed {
+		t.Fatalf("overload changed dependency failures: %+v", stats)
+	}
+}
+
+func TestOverloadedRecoveryProbeCanBeRetried(t *testing.T) {
+	cb := &CircuitBreaker{
+		state: CircuitOpen, lastFailureTime: time.Now().Add(-time.Minute),
+		timeout: time.Second, successThreshold: 1,
+	}
+	_ = cb.Execute(func() error { return ErrFlareSolverrBusy })
+	if err := cb.Execute(func() error { return nil }); err != nil {
+		t.Fatalf("local capacity error prevented another recovery probe: %v", err)
+	}
+	if cb.State() != CircuitClosed {
+		t.Fatal("successful probe did not recover the circuit")
+	}
+}
 
 func TestCircuitBreakerAllowsOneHalfOpenProbe(t *testing.T) {
 	cb := &CircuitBreaker{

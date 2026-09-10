@@ -22,7 +22,9 @@ func TestHandlerJadwalUsesOneSessionForTokenAndSchedule(t *testing.T) {
 				http.Error(w, "bad search parameters", http.StatusBadRequest)
 				return
 			}
-			_, _ = w.Write([]byte(`<table><tr><td>1</td><td>Senin</td><td>Algoritma</td><td>1</td><td>D201</td><td>Dr. Ada</td></tr></table>`))
+			_, _ = w.Write([]byte(`<table><tr><th>KELAS</th><th>HARI</th><th>MATA KULIAH</th>` +
+				`<th>WAKTU</th><th>RUANG</th><th>DOSEN</th></tr>` +
+				`<tr><td>1</td><td>Senin</td><td>Algoritma</td><td>1</td><td>D201</td><td>Dr. Ada</td></tr></table>`))
 		case "/kuliahUjian/6":
 			_, _ = w.Write([]byte(`<table class="cell-xs-6"><tr><td>1</td><td>07.30 - 08.20</td></tr></table>`))
 		default:

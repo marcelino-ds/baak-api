@@ -15,32 +15,34 @@ import (
 func init() {
 	config.LoadConfig()
 	configurationError = config.AppConfig.Validate()
+	applicationHandler = buildHandler(http.HandlerFunc(handleRoutes))
 }
 
 var configurationError error
+var applicationHandler http.Handler
+
+func buildHandler(next http.Handler) http.Handler {
+	routes := middleware.RateLimitMiddleware(next)
+	configuredRoutes := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if configurationError != nil {
+			log.Printf("invalid configuration: %v", configurationError)
+			utils.WriteConfigurationError(w)
+			return
+		}
+		routes.ServeHTTP(w, r)
+	})
+	return middleware.LoggingMiddleware(
+		middleware.RecoveryMiddleware(
+			middleware.CORSMiddleware(configuredRoutes),
+		),
+	)
+}
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	if configurationError != nil {
-		log.Printf("invalid configuration: %v", configurationError)
-		utils.WriteConfigurationError(w)
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), config.RequestTimeout)
 	defer cancel()
 
-	r = r.WithContext(ctx)
-
-	// Apply middleware chain
-	handler := middleware.RecoveryMiddleware(
-		middleware.LoggingMiddleware(
-			middleware.CORSMiddleware(
-				middleware.RateLimitMiddleware(
-					http.HandlerFunc(handleRoutes),
-				),
-			),
-		),
-	)
-	handler.ServeHTTP(w, r)
+	applicationHandler.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func handleRoutes(w http.ResponseWriter, r *http.Request) {

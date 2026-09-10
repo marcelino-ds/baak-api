@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -10,23 +11,26 @@ import (
 )
 
 const (
-	RequestTimeout  = 50 * time.Second
-	HealthTimeout   = 3 * time.Second
-	ShutdownTimeout = 55 * time.Second
+	RequestTimeout                   = 50 * time.Second
+	HealthTimeout                    = 3 * time.Second
+	ShutdownTimeout                  = 55 * time.Second
+	DefaultFlareSolverrMaxConcurrent = 2
 )
 
 type Config struct {
-	Port             string
-	BaseURL          string
-	RateLimitPerMin  int
-	RateLimitBurst   int
-	AllowedOrigins   []string
-	FlareSolverrURL  string
-	CacheTTLJadwal   time.Duration
-	CacheTTLKalender time.Duration
-	CacheEnabled     bool
-	CacheMaxEntries  int
-	HTTPProxies      []string
+	Port                      string
+	BaseURL                   string
+	RateLimitPerMin           int
+	RateLimitBurst            int
+	AllowedOrigins            []string
+	FlareSolverrURL           string
+	CacheTTLJadwal            time.Duration
+	CacheTTLKalender          time.Duration
+	CacheEnabled              bool
+	CacheMaxEntries           int
+	HTTPProxies               []string
+	TrustedProxies            []string
+	FlareSolverrMaxConcurrent int
 }
 
 var AppConfig Config
@@ -39,17 +43,19 @@ func LoadConfig() {
 	}
 
 	AppConfig = Config{
-		Port:             port,
-		BaseURL:          strings.TrimRight(strings.TrimSpace(getEnvOrDefault("BASE_URL", "https://baak.gunadarma.ac.id")), "/"),
-		RateLimitPerMin:  getPositiveIntOrDefault("RATE_LIMIT_PER_MIN", 60),
-		RateLimitBurst:   getPositiveIntOrDefault("RATE_LIMIT_BURST", 10),
-		AllowedOrigins:   getEnvSliceOrDefault("ALLOWED_ORIGINS", []string{"*"}),
-		FlareSolverrURL:  strings.TrimRight(strings.TrimSpace(os.Getenv("FLARESOLVERR_URL")), "/"),
-		CacheTTLJadwal:   getTTLOrDefault("CACHE_TTL_JADWAL", 300),
-		CacheTTLKalender: getTTLOrDefault("CACHE_TTL_KALENDER", 3600),
-		CacheEnabled:     getEnvBoolOrDefault("CACHE_ENABLED", true),
-		CacheMaxEntries:  getPositiveIntOrDefault("CACHE_MAX_ENTRIES", 1024),
-		HTTPProxies:      getEnvSliceOrDefault("HTTP_PROXIES", nil),
+		Port:                      port,
+		BaseURL:                   strings.TrimRight(strings.TrimSpace(getEnvOrDefault("BASE_URL", "https://baak.gunadarma.ac.id")), "/"),
+		RateLimitPerMin:           getPositiveIntOrDefault("RATE_LIMIT_PER_MIN", 60),
+		RateLimitBurst:            getPositiveIntOrDefault("RATE_LIMIT_BURST", 10),
+		AllowedOrigins:            getEnvSliceOrDefault("ALLOWED_ORIGINS", []string{"*"}),
+		FlareSolverrURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("FLARESOLVERR_URL")), "/"),
+		CacheTTLJadwal:            getTTLOrDefault("CACHE_TTL_JADWAL", 300),
+		CacheTTLKalender:          getTTLOrDefault("CACHE_TTL_KALENDER", 3600),
+		CacheEnabled:              getEnvBoolOrDefault("CACHE_ENABLED", true),
+		CacheMaxEntries:           getPositiveIntOrDefault("CACHE_MAX_ENTRIES", 1024),
+		HTTPProxies:               getEnvSliceOrDefault("HTTP_PROXIES", nil),
+		TrustedProxies:            getEnvSliceOrDefault("TRUSTED_PROXIES", nil),
+		FlareSolverrMaxConcurrent: getPositiveIntOrDefault("FLARESOLVERR_MAX_CONCURRENT", DefaultFlareSolverrMaxConcurrent),
 	}
 }
 
@@ -73,7 +79,52 @@ func (c Config) Validate() error {
 			return fmt.Errorf("HTTP_PROXIES contains an invalid proxy URL")
 		}
 	}
+	if _, err := c.TrustedProxyPrefixes(); err != nil {
+		return fmt.Errorf("TRUSTED_PROXIES: %w", err)
+	}
 	return nil
+}
+
+// TrustedProxyPrefixes parses the proxy addresses allowed to provide client IP headers.
+func (c Config) TrustedProxyPrefixes() ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(c.TrustedProxies))
+	for _, value := range c.TrustedProxies {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+
+		var prefix netip.Prefix
+		if parsed, err := netip.ParsePrefix(value); err == nil {
+			prefix = parsed
+		} else if address, addressErr := netip.ParseAddr(value); addressErr == nil {
+			if address.Zone() != "" {
+				return nil, fmt.Errorf("%q must not contain an IPv6 zone", value)
+			}
+			prefix = netip.PrefixFrom(address.Unmap(), address.Unmap().BitLen())
+		} else {
+			return nil, fmt.Errorf("%q must be an IP address or CIDR", value)
+		}
+
+		address := prefix.Addr()
+		if !address.IsValid() || address.Zone() != "" {
+			return nil, fmt.Errorf("%q must be a valid IP address or CIDR", value)
+		}
+		if address.Is4In6() {
+			bits := prefix.Bits()
+			if bits < 96 {
+				return nil, fmt.Errorf("%q has an invalid IPv4-mapped prefix length", value)
+			}
+			prefix = netip.PrefixFrom(address.Unmap(), bits-96)
+		} else {
+			prefix = netip.PrefixFrom(address, prefix.Bits())
+		}
+		if prefix.Bits() == 0 {
+			return nil, fmt.Errorf("%q must not trust every address", value)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
 }
 
 func ValidateBaseURL(value string) error {

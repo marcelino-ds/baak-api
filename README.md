@@ -133,6 +133,7 @@ Error codes:
 - `CLOUDFLARE_BLOCKED` - Terblokir oleh Cloudflare
 - `CIRCUIT_OPEN` - Circuit breaker terbuka
 - `FLARESOLVERR_ERROR` - Error saat menggunakan FlareSolverr
+- `FLARESOLVERR_BUSY` - Kapasitas request FlareSolverr sedang penuh
 - `RATE_LIMITED` - Terlalu banyak request
 - `UPSTREAM_ERROR` - Error dari server BAAK
 - `SESSION_ERROR` - Gagal membuat session
@@ -150,9 +151,10 @@ bisa diterima sekaligus, default 10. Request saat token habis mendapat HTTP 429
 dengan kode `RATE_LIMITED`. Preflight `OPTIONS` tidak menghabiskan token.
 
 IP diambil dari koneksi langsung (`RemoteAddr`). `X-Forwarded-For` dan `X-Real-IP`
-diabaikan agar client tidak bisa mengganti identitas lewat header. Jika API nanti
-dipasang di belakang reverse proxy, semua client di belakang proxy tersebut akan
-berbagi batas IP proxy sampai dukungan trusted proxy ditambahkan.
+diabaikan agar client tidak bisa mengganti identitas lewat header. Jika API dipasang
+di belakang reverse proxy, isi `TRUSTED_PROXIES` dengan alamat atau CIDR proxy yang
+benar-benar dikelola sendiri. Hanya header dari peer yang cocok dengan daftar itu yang
+dipakai untuk memisahkan client; nilai lain tetap dianggap berasal dari peer socket.
 
 Nilai rate dan burst harus bilangan bulat positif; nilai tidak valid memakai
 default. Sebelumnya rate efektif di-hardcode 5 per detik; sekarang default mengikuti
@@ -170,11 +172,13 @@ API bisa dikonfigurasi menggunakan environment variables:
 | `RATE_LIMIT_BURST` | `10` | Kapasitas burst per IP |
 | `ALLOWED_ORIGINS` | `*` | Origin CORS yang diizinkan, dipisahkan koma |
 | `FLARESOLVERR_URL` | - | URL FlareSolverr (e.g., `http://localhost:8191`) |
+| `FLARESOLVERR_MAX_CONCURRENT` | `2` | Jumlah request FlareSolverr aktif per proses |
 | `CACHE_TTL_JADWAL` | `300` | TTL cache jadwal dalam detik |
 | `CACHE_TTL_KALENDER` | `3600` | TTL cache kalender dalam detik |
 | `CACHE_ENABLED` | `true` | Enable/disable caching |
 | `CACHE_MAX_ENTRIES` | `1024` | Batas jumlah entry cache dalam memori |
 | `HTTP_PROXIES` | - | URL proxy HTTP/HTTPS dipisahkan koma |
+| `TRUSTED_PROXIES` | - | Alamat/CIDR reverse proxy yang boleh mengirim `X-Forwarded-For` atau `X-Real-IP` |
 
 ### CORS Lokal
 
@@ -188,6 +192,9 @@ HTTP 403. Request biasa dari origin yang tidak terdaftar tetap diproses tanpa he
 izin CORS, sehingga browser tidak dapat membaca responsnya. CORS bukan autentikasi;
 request tanpa `Origin`, misalnya dari curl, tetap bisa memakai API.
 
+Frontend dapat membaca header respons `X-Request-ID` dan `Retry-After` untuk
+melacak error dan menentukan waktu retry.
+
 Contoh untuk frontend lokal di PowerShell:
 
 ```powershell
@@ -199,6 +206,13 @@ go run .
 
 Restart server setelah mengubah environment variable.
 
+### Log Request
+
+Log akses menyertakan request ID acak, method, template route, status, dan durasi.
+Query string, parameter path, alamat IP, cookie, dan header autentikasi tidak ditulis
+ke log akses. Setiap respons mendapat `X-Request-ID` baru dari server; nilai dari
+client diabaikan. Log panic memakai ID yang sama tanpa mencetak isi payload panic.
+
 ### Cache Jadwal dan Kalender
 
 - `GET /jadwal/{kelas}` dan `GET /jadwal?q=...` berbagi cache untuk teks pencarian yang sama. TTL default 300 detik (5 menit).
@@ -206,6 +220,16 @@ Restart server setelah mengubah environment variable.
 - Cache dipisahkan berdasarkan `BASE_URL`; perubahan sumber data tidak memakai hasil dari sumber sebelumnya.
 
 Cache menyimpan hasil parsing yang berhasil, termasuk hasil kosong. Error dan pengambilan yang dibatalkan tidak disimpan. Request bersamaan untuk data yang sama berbagi satu proses pengambilan; TTL dihitung setelah data selesai diambil. Data yang kedaluwarsa diambil ulang saat ada request berikutnya.
+
+Parser jadwal mengenali tabel dari header Kelas, Hari, Mata Kuliah, Waktu, Ruang,
+dan Dosen, termasuk jika urutan kolom berubah atau ada tabel lain pada halaman.
+Tabel dengan header lengkap tanpa baris data tetap menjadi hasil kosong yang sah.
+Header yang tidak lengkap, baris yang terpotong, atau hari yang tidak dikenali
+menghasilkan HTTP 502 `UPSTREAM_ERROR` dan tidak disimpan ke cache.
+
+Semua respons JSON menggunakan `Cache-Control: no-store` agar browser dan proxy
+tidak menyimpan respons API, termasuk data mahasiswa dan error. Cache internal
+jadwal dan kalender tetap berjalan sesuai TTL di atas.
 
 `CACHE_ENABLED=false` menonaktifkan pembacaan dan penulisan cache. TTL nol atau negatif menonaktifkan cache untuk endpoint terkait. Konfigurasi dibaca saat startup; restart server setelah mengubah environment variable. Cache hanya ada di memori proses dan kosong kembali setelah restart. Statistik entri tersedia lewat `/health` saat cache aktif.
 
@@ -221,6 +245,21 @@ docker compose up -d --wait flaresolverr
 Service memakai FlareSolverr 3.5.0 dan hanya membuka port `127.0.0.1:8191`.
 Log request dinonaktifkan pada level `warning` agar cookie dan token form tidak
 tercetak di log. API Go dijalankan langsung di komputer, terpisah dari container.
+
+API membatasi dua request FlareSolverr aktif per proses secara default. Request saat
+kapasitas penuh langsung mendapat HTTP 503 `FLARESOLVERR_BUSY` dengan
+`Retry-After: 1`, tanpa antrean tambahan. Atur `FLARESOLVERR_MAX_CONCURRENT` sesuai
+kapasitas solver; nilai tidak valid, nol, atau negatif memakai default 2. Batas ini
+dibagi semua scraper dalam satu proses API, bukan lintas replica. Health check tidak
+memakai slot solver, dan penolakan karena kapasitas tidak dihitung sebagai kegagalan
+dependency oleh circuit breaker.
+
+Pembatalan atau deadline request menghentikan waktu tunggu pemanggil. Pekerjaan
+solver yang sudah dikirim tetap memakai slot hingga respons selesai dibaca atau
+batas waktu koneksi solver tercapai (maksimal 65 detik). Hasil yang datang setelah
+pemanggil batal tidak memperbarui cookie atau cache. Batas waktu koneksi membatasi
+pekerjaan lokal API; terputusnya koneksi tidak menjamin browser di server solver
+langsung berhenti.
 
 Di PowerShell:
 

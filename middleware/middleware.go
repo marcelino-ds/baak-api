@@ -1,6 +1,10 @@
 package middleware
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -18,9 +22,99 @@ import (
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s %v", r.Method, r.RequestURI, r.RemoteAddr, time.Since(start))
+		requestID, err := newRequestID()
+		if err != nil {
+			utils.WriteInternalServerError(w)
+			return
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		response := &statusWriter{ResponseWriter: w}
+		requestContext := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
+		next.ServeHTTP(response, r.WithContext(requestContext))
+		status := response.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		// Log a route template; query strings and path parameters may contain private data.
+		log.Printf("event=request request_id=%s method=%s route=%q status=%d duration_ms=%d",
+			requestID, logMethod(r.Method), logRoute(r.URL.Path), status, time.Since(start).Milliseconds())
 	})
+}
+
+type requestIDContextKey struct{}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if status >= 200 && w.status != 0 {
+		return
+	}
+	if status >= 200 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func newRequestID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate request ID: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func logRoute(path string) string {
+	switch {
+	case path == "/":
+		return "/"
+	case path == "/health", path == "/ready", path == "/live", path == "/jadwal", path == "/kalender":
+		return path
+	case strings.HasPrefix(path, "/jadwal/"):
+		return "/jadwal/{search}"
+	case strings.HasPrefix(path, "/kelasbaru/"):
+		return "/kelasbaru/{search}"
+	case strings.HasPrefix(path, "/uts/"):
+		return "/uts/{search}"
+	case strings.HasPrefix(path, "/mahasiswabaru/"):
+		return "/mahasiswabaru/{search}"
+	default:
+		return "unmatched"
+	}
+}
+
+func logMethod(method string) string {
+	switch method {
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodOptions:
+		return http.MethodOptions
+	case http.MethodHead:
+		return http.MethodHead
+	case http.MethodPost:
+		return http.MethodPost
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodDelete:
+		return http.MethodDelete
+	default:
+		return "OTHER"
+	}
 }
 
 // CORSMiddleware handles CORS
@@ -58,6 +152,7 @@ func CORSMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOriginValue(origin, config.AppConfig.AllowedOrigins))
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, Retry-After")
 		if r.Method == http.MethodOptions {
 			requestedMethod := strings.TrimSpace(r.Header.Get("Access-Control-Request-Method"))
 			if requestedMethod != "" && requestedMethod != http.MethodGet {
@@ -228,12 +323,13 @@ func RateLimitMiddleware(next http.Handler) http.Handler {
 }
 
 func rateLimitMiddleware(next http.Handler, limiter *IPRateLimiter) http.Handler {
+	resolver := newClientIPResolver()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions || r.URL.Path == "/live" || r.URL.Path == "/ready" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		ip := getClientIP(r)
+		ip := resolver.resolve(r)
 		clientLimiter := limiter.getLimiter(ip)
 
 		if !clientLimiter.Allow() {
@@ -249,12 +345,84 @@ func rateLimitMiddleware(next http.Handler, limiter *IPRateLimiter) http.Handler
 	})
 }
 
+type clientIPResolver struct {
+	trusted []netip.Prefix
+}
+
+func newClientIPResolver() clientIPResolver {
+	trusted, err := config.AppConfig.TrustedProxyPrefixes()
+	if err != nil {
+		return clientIPResolver{}
+	}
+	return clientIPResolver{trusted: trusted}
+}
+
+func (resolver clientIPResolver) resolve(r *http.Request) string {
+	peer := getClientIP(r)
+	peerAddress, ok := parseHeaderIP(peer)
+	if !ok || !resolver.isTrusted(peerAddress) {
+		return peer
+	}
+
+	forwarded := r.Header.Values("X-Forwarded-For")
+	if len(forwarded) > 0 {
+		values := strings.Split(strings.Join(forwarded, ","), ",")
+		if len(values) > 64 {
+			return peer
+		}
+		addresses := make([]netip.Addr, len(values))
+		for index := len(values) - 1; index >= 0; index-- {
+			address, valid := parseHeaderIP(values[index])
+			if !valid {
+				return peer
+			}
+			addresses[index] = address
+			if !resolver.isTrusted(address) {
+				// The nearest untrusted hop is the client identity. Older entries
+				// may have been supplied by that client and are ignored.
+				return address.String()
+			}
+		}
+		return addresses[0].String()
+	}
+
+	realIP := r.Header.Values("X-Real-IP")
+	if len(realIP) == 1 {
+		if address, valid := parseHeaderIP(realIP[0]); valid {
+			return address.String()
+		}
+	}
+	return peer
+}
+
+func (resolver clientIPResolver) isTrusted(address netip.Addr) bool {
+	for _, prefix := range resolver.trusted {
+		if prefix.Contains(address.Unmap()) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseHeaderIP(value string) (netip.Addr, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return netip.Addr{}, false
+	}
+	address, err := netip.ParseAddr(value)
+	if err != nil || address.Zone() != "" {
+		return netip.Addr{}, false
+	}
+	return address.Unmap(), true
+}
+
 // RecoveryMiddleware handles panics
 func RecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				log.Printf("Panic: %v", err)
+				requestID, _ := r.Context().Value(requestIDContextKey{}).(string)
+				log.Printf("event=panic request_id=%s panic_type=%T", requestID, err)
 				utils.WriteErrorResponse(w, http.StatusInternalServerError,
 					"An unexpected error occurred")
 			}
