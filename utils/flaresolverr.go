@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type FlareSolverrRequest struct {
 	Cmd        string        `json:"cmd"`
 	URL        string        `json:"url"`
 	MaxTimeout int           `json:"maxTimeout"`
+	PostData   string        `json:"postData,omitempty"`
 	Cookies    []FlareCookie `json:"cookies,omitempty"`
 }
 
@@ -122,6 +124,15 @@ func (fs *FlareSolverr) Fetch(targetURL string) (string, error) {
 
 // FetchContext fetches a URL through FlareSolverr while honoring cancellation.
 func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar http.CookieJar) (string, error) {
+	return fs.fetchContext(ctx, targetURL, jar, "request.get", "")
+}
+
+// FetchFormContext submits a form through FlareSolverr while honoring cancellation.
+func (fs *FlareSolverr) FetchFormContext(ctx context.Context, targetURL string, jar http.CookieJar, values url.Values) (string, error) {
+	return fs.fetchContext(ctx, targetURL, jar, "request.post", values.Encode())
+}
+
+func (fs *FlareSolverr) fetchContext(ctx context.Context, targetURL string, jar http.CookieJar, command, postData string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -137,9 +148,10 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	}
 
 	reqBody := FlareSolverrRequest{
-		Cmd:        "request.get",
+		Cmd:        command,
 		URL:        targetURL,
 		MaxTimeout: 60000, // 60 seconds
+		PostData:   postData,
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline).Milliseconds()
@@ -182,6 +194,11 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	req.Header.Set("Content-Type", "application/json")
 	release, err := acquireFlareSolverrSlot(ctx)
 	if err != nil {
+		cancelSolver()
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		release()
 		cancelSolver()
 		return "", err
 	}

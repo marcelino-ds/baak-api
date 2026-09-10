@@ -259,6 +259,143 @@ func (s *Scraper) FetchDocument(ctx context.Context, targetURL string) (*goquery
 	return doc, nil
 }
 
+// FetchFormDocument submits URL-encoded form data, with the same circuit and
+// FlareSolverr fallback policy as FetchDocument.
+func (s *Scraper) FetchFormDocument(ctx context.Context, targetURL string, values url.Values) (*goquery.Document, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.ensureClient(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.breaker == nil {
+		s.breaker = GetCircuitBreaker()
+	}
+	if s.flareBreaker == nil {
+		s.flareBreaker = GetFlareCircuitBreaker()
+	}
+	breaker, flareBreaker := s.breaker, s.flareBreaker
+	s.mu.Unlock()
+
+	var doc *goquery.Document
+	err := breaker.Execute(func() error {
+		var fetchErr error
+		doc, fetchErr = s.fetchFormWithRetry(ctx, targetURL, values, 3)
+		if isCloudflareError(fetchErr) && s.flareSolverr != nil {
+			return flareBreaker.Execute(func() error {
+				doc, fetchErr = s.fetchFormFlareSolverr(ctx, targetURL, values)
+				return fetchErr
+			})
+		}
+		return fetchErr
+	})
+	if errors.Is(err, ErrCircuitOpen) && s.flareSolverr != nil {
+		var flareErr error
+		err = flareBreaker.Execute(func() error {
+			doc, flareErr = s.fetchFormFlareSolverr(ctx, targetURL, values)
+			return flareErr
+		})
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	return doc, nil
+}
+
+func (s *Scraper) fetchFormFlareSolverr(ctx context.Context, targetURL string, values url.Values) (*goquery.Document, error) {
+	body, err := s.flareSolverr.FetchFormContext(ctx, targetURL, s.client.Jar, values)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrFlareSolverr, err)
+	}
+	if IsCloudflareChallenge(body) {
+		return nil, ErrCloudflareBlocked
+	}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse solver form response: %w", ErrFlareSolverr, err)
+	}
+	return doc, nil
+}
+
+func (s *Scraper) fetchFormOnce(ctx context.Context, targetURL, referrer string, values url.Values) (*goquery.Document, error) {
+	if err := s.ensureClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(values.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create form request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", userAgents[0])
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8")
+	req.Header.Set("Referer", referrer)
+	response, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUpstream, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 32<<10))
+		return nil, upstreamStatusError{code: response.StatusCode}
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxHTMLBodyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUpstream, err)
+	}
+	if int64(len(body)) > maxHTMLBodyBytes {
+		return nil, fmt.Errorf("%w: HTML response exceeds size limit", ErrUnexpectedPage)
+	}
+	if IsCloudflareChallenge(string(body)) {
+		return nil, ErrCloudflareBlocked
+	}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %w", err)
+	}
+	return doc, nil
+}
+
+func (s *Scraper) fetchFormWithRetry(ctx context.Context, targetURL string, values url.Values, maxRetries int) (*goquery.Document, error) {
+	if maxRetries < 1 {
+		return nil, errors.New("max retries must be positive")
+	}
+	s.mu.Lock()
+	referrer := s.referrer
+	s.mu.Unlock()
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		doc, err := s.fetchFormOnce(ctx, targetURL, referrer, values)
+		if err == nil {
+			return doc, nil
+		}
+		lastErr = err
+		if isCloudflareError(err) || errors.Is(err, ErrUnexpectedPage) {
+			break
+		}
+		var statusErr upstreamStatusError
+		if errors.As(err, &statusErr) && statusErr.code < 500 && statusErr.code != http.StatusRequestTimeout {
+			break
+		}
+		if attempt+1 < maxRetries {
+			if err := waitForRetry(ctx, time.Duration(250*(1<<attempt))*time.Millisecond); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, fmt.Errorf("all retry attempts failed: %w", lastErr)
+}
+
 func (s *Scraper) fetchFlareSolverr(ctx context.Context, targetURL string) (*goquery.Document, error) {
 	if s.flareSolverr == nil {
 		return nil, errors.New("FlareSolverr not configured")

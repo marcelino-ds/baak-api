@@ -26,6 +26,7 @@ Perlu diketahui bahwa proyek ini tidak berafiliasi dengan Universitas Gunadarma 
 - **NEW**: FlareSolverr support untuk Cloudflare bypass
 - **NEW**: Circuit breaker pattern untuk resiliensi
 - **NEW**: In-memory caching untuk mengurangi beban
+- Endpoint publik read-only untuk katalog akademik, ujian, berita, dokumen, dan prosedur layanan
 
 ## Endpoint API
 
@@ -103,6 +104,40 @@ Mendapatkan informasi untuk mahasiswa baru.
 Parameter:
 
 - `kelas_atau_nama` (path parameter): Kode kelas atau nama mahasiswa
+
+### Katalog Publik BAAK
+
+```text
+GET /catalog
+GET /public/{section}
+```
+
+`/catalog` mengembalikan daftar section publik yang tersedia. Semua section berikut
+bersifat read-only dan mengembalikan JSON terstandardisasi dengan `title`, `text`,
+`links`, `tables`, `records`, `options`, serta `pagination` jika tersedia:
+
+- `/ujian-utama?jurusan=...` - Jadwal Ujian Utama per jurusan
+- `/uas/{kelas}` - Jadwal UAS per kelas
+- `/mata-kuliah` - Daftar mata kuliah dan dokumen katalog
+- `/dosen-wali/{tingkat}` - Daftar dosen wali kelas
+- `/koordinator` - Koordinator mata kuliah, termasuk pagination
+- `/pembimbing-pi` - Dosen pembimbing dan mahasiswa PI
+- `/panduan-kuliah` dan `/jadwal-ujian` - Informasi panduan perkuliahan/ujian
+- `/ujian-bentrok` dan `/frs` - Prosedur publik dan dokumen terkait
+- `/berita` atau `/berita/{id}` - Daftar/detail berita BAAK
+- `/buku-pedoman` - Daftar buku pedoman dan tautan dokumen
+- `/layanan/{slug}` - `daftar-ulang`, `cuti`, `nonaktif`, `pengecekan-nilai`, `pindah-lokasi`, `pindah-jurusan`
+- `/situs` dan `/loket` - Tautan situs resmi dan jam pelayanan loket
+
+Endpoint katalog hanya membaca halaman sumber. Ia tidak melakukan perubahan data,
+pengisian KRS, daftar ulang, pengajuan cuti, atau pengajuan ujian bentrok. UAS
+mengikuti formulir BAAK dengan session dan CSRF token, sedangkan Ujian Utama memakai
+parameter `jurusan` yang dipilih BAAK.
+
+Untuk section tabel yang mendukung pencarian, gunakan `q` atau parameter asli BAAK
+(`search_wali`, `search_koor`, `search_pi`) dan `page` 1 sampai 10000. Satu request
+mengambil satu halaman sumber, sehingga seluruh daftar PI tetap dapat diakses. Contoh:
+`/koordinator?q=algoritma&page=2`. UAS menerima `/uas/1IA01` atau `/uas?q=1IA01`.
 
 ## Format Response
 

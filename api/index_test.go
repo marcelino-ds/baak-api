@@ -64,6 +64,35 @@ func TestRequestIDIsReadableByFrontend(t *testing.T) {
 	}
 }
 
+func TestPublicCatalogExposesReadOnlySections(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/catalog", nil)
+	response := httptest.NewRecorder()
+	Handler(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "ujian-utama") || !strings.Contains(response.Body.String(), "layanan") {
+		t.Fatalf("catalog response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAllrounderDiscoveryAndValidationRoutes(t *testing.T) {
+	tests := []struct {
+		path     string
+		status   int
+		contains string
+	}{
+		{path: "/dokumen", status: 200, contains: "buku-pedoman"},
+		{path: "/layanan", status: 200, contains: "pindah-jurusan"},
+		{path: "/ktm/", status: 400, contains: "VALIDATION_ERROR"},
+		{path: "/dokumen/unknown", status: 404, contains: "NOT_FOUND"},
+	}
+	for _, tt := range tests {
+		response := httptest.NewRecorder()
+		handleRoutes(response, httptest.NewRequest(http.MethodGet, tt.path, nil))
+		if response.Code != tt.status || !strings.Contains(response.Body.String(), tt.contains) {
+			t.Errorf("%s: %d %s", tt.path, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestLiveProbeDoesNotDependOnUpstream(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/live", nil)
 	response := httptest.NewRecorder()
