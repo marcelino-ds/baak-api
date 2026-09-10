@@ -16,9 +16,9 @@ func HandlerMahasiswaBaru(w http.ResponseWriter, r *http.Request) {
 		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	searchTerm := strings.TrimPrefix(r.URL.Path, "/mahasiswabaru/")
-	if searchTerm == "" {
-		utils.WriteValidationError(w, "Missing search term in URL")
+	searchTerm, validationErr := pathSearch(r.URL.Path, "/mahasiswabaru/")
+	if validationErr != nil {
+		utils.WriteValidationError(w, validationErr.Error())
 		return
 	}
 	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
@@ -29,10 +29,11 @@ func HandlerMahasiswaBaru(w http.ResponseWriter, r *http.Request) {
 
 	searchTypes := []string{"Kelas", "Nama"}
 	var mahasiswaBaru []models.MahasiswaBaru
-	mhsBaruBaseURL := fmt.Sprintf("%s/cariMhsBaru", config.AppConfig.BaseURL)
+	baseURL := strings.TrimRight(config.AppConfig.BaseURL, "/")
+	mhsBaruBaseURL := fmt.Sprintf("%s/cariMhsBaru", baseURL)
 	token, err := scraper.GetCSRFToken(r.Context(), mhsBaruBaseURL)
 	if err != nil {
-		token, err = scraper.GetCSRFToken(r.Context(), config.AppConfig.BaseURL)
+		token, err = scraper.GetCSRFToken(r.Context(), baseURL)
 		if err != nil {
 			utils.WriteHTTPError(w, err)
 			return
@@ -41,7 +42,7 @@ func HandlerMahasiswaBaru(w http.ResponseWriter, r *http.Request) {
 
 	for _, searchType := range searchTypes {
 		searchURL := fmt.Sprintf("%s/cariMhsBaru?_token=%s&tipeMhsBaru=%s&teks=%s",
-			config.AppConfig.BaseURL,
+			baseURL,
 			url.QueryEscape(token),
 			url.QueryEscape(searchType),
 			url.QueryEscape(searchTerm),

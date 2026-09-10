@@ -2,9 +2,9 @@ package api
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/yafyx/baak-api/config"
 	"github.com/yafyx/baak-api/handlers"
@@ -14,10 +14,18 @@ import (
 
 func init() {
 	config.LoadConfig()
+	configurationError = config.AppConfig.Validate()
 }
 
+var configurationError error
+
 func Handler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
+	if configurationError != nil {
+		log.Printf("invalid configuration: %v", configurationError)
+		utils.WriteConfigurationError(w)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), config.RequestTimeout)
 	defer cancel()
 
 	r = r.WithContext(ctx)
@@ -41,6 +49,10 @@ func handleRoutes(w http.ResponseWriter, r *http.Request) {
 		handlers.HandlerHomepage(w, r)
 	case r.URL.Path == "/health":
 		handlers.HandlerHealth(w, r)
+	case r.URL.Path == "/ready":
+		handlers.HandlerHealth(w, r)
+	case r.URL.Path == "/live":
+		handlers.HandlerLive(w, r)
 	case r.URL.Path == "/jadwal":
 		handlers.HandlerJadwalSearch(w, r)
 	case strings.HasPrefix(r.URL.Path, "/jadwal/"):

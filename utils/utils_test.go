@@ -35,6 +35,16 @@ func TestScraperHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestNewScraperNormalizesBaseURLAndRejectsCredentials(t *testing.T) {
+	scraper, err := NewScraper("https://baak.example///")
+	if err != nil || scraper.BaseURL != "https://baak.example" {
+		t.Fatalf("normalized URL = %q, %v", scraper.BaseURL, err)
+	}
+	if _, err := NewScraper("https://user:secret@baak.example"); err == nil {
+		t.Fatal("accepted credentials in base URL")
+	}
+}
+
 func TestScraperPreservesCookiesWhenFallingBackToFlareSolverr(t *testing.T) {
 	var flareRequest string
 	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -229,6 +229,10 @@ func RateLimitMiddleware(next http.Handler) http.Handler {
 
 func rateLimitMiddleware(next http.Handler, limiter *IPRateLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions || r.URL.Path == "/live" || r.URL.Path == "/ready" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		ip := getClientIP(r)
 		clientLimiter := limiter.getLimiter(ip)
 

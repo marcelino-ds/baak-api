@@ -82,3 +82,32 @@ func TestLoadConfigFiltersEmptyOrigins(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigValidateRejectsUnsafeURLsAndPorts(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "invalid port", cfg: Config{Port: ":70000", BaseURL: "https://baak.example"}},
+		{name: "credentials", cfg: Config{Port: ":8080", BaseURL: "https://user:pass@baak.example"}},
+		{name: "query", cfg: Config{Port: ":8080", BaseURL: "https://baak.example/?token=secret"}},
+		{name: "invalid proxy", cfg: Config{Port: ":8080", BaseURL: "https://baak.example", HTTPProxies: []string{"ftp://proxy.example"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.cfg.Validate(); err == nil {
+				t.Fatal("Validate accepted invalid configuration")
+			}
+		})
+	}
+}
+
+func TestConfigValidateAcceptsURLPathAndHTTPProxy(t *testing.T) {
+	cfg := Config{
+		Port: ":8080", BaseURL: "https://baak.example/portal",
+		FlareSolverrURL: "http://127.0.0.1:8191", HTTPProxies: []string{"http://127.0.0.1:3128"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected valid configuration: %v", err)
+	}
+}

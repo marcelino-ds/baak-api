@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/yafyx/baak-api/config"
 )
 
 // FlareSolverrRequest represents a request to FlareSolverr
@@ -53,15 +54,25 @@ type FlareSolverr struct {
 
 // GetFlareSolverr returns the FlareSolverr instance if configured
 func GetFlareSolverr() *FlareSolverr {
-	url := strings.TrimRight(os.Getenv("FLARESOLVERR_URL"), "/")
+	url := config.AppConfig.FlareSolverrURL
 	if url == "" {
 		return nil
 	}
 	return &FlareSolverr{
 		url:    url,
-		client: &http.Client{Timeout: 120 * time.Second},
+		client: flareClient,
 	}
 }
+
+var flareClient = func() *http.Client {
+	transport := newTransport()
+	transport.MaxConnsPerHost = 2
+	transport.MaxIdleConnsPerHost = 2
+	transport.ResponseHeaderTimeout = 65 * time.Second
+	return &http.Client{Timeout: 65 * time.Second, Transport: transport}
+}()
+
+var flareHealthClient = &http.Client{Timeout: config.HealthTimeout, Transport: directTransport}
 
 // IsConfigured returns true if FlareSolverr is configured
 func (fs *FlareSolverr) IsConfigured() bool {
@@ -81,11 +92,24 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	if fs == nil || fs.url == "" {
 		return "", fmt.Errorf("FlareSolverr not configured")
 	}
+	client := fs.client
+	if client == nil {
+		client = flareClient
+	}
 
 	reqBody := FlareSolverrRequest{
 		Cmd:        "request.get",
 		URL:        targetURL,
 		MaxTimeout: 60000, // 60 seconds
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline).Milliseconds()
+		if remaining < 1 {
+			return "", context.DeadlineExceeded
+		}
+		if remaining < int64(reqBody.MaxTimeout) {
+			reqBody.MaxTimeout = int(remaining)
+		}
 	}
 	if jar != nil {
 		if parsedURL, err := http.NewRequest(http.MethodGet, targetURL, nil); err == nil {
@@ -109,11 +133,14 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := fs.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%w: HTTP status %d", ErrFlareSolverr, resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTMLBodyBytes+1))
 	if err != nil {
@@ -129,10 +156,10 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 	}
 
 	if fsResp.Status != "ok" {
-		return "", fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
+		return "", fmt.Errorf("%w: solver rejected the request", ErrFlareSolverr)
 	}
 	if fsResp.Solution.Status != http.StatusOK {
-		return "", fmt.Errorf("FlareSolverr unexpected status code: %d", fsResp.Solution.Status)
+		return "", upstreamStatusError{code: fsResp.Solution.Status}
 	}
 	if jar != nil {
 		cookieURL := targetURL
@@ -142,7 +169,7 @@ func (fs *FlareSolverr) FetchContext(ctx context.Context, targetURL string, jar 
 		if parsedURL, err := http.NewRequest(http.MethodGet, cookieURL, nil); err == nil {
 			cookies := make([]*http.Cookie, 0, len(fsResp.Solution.Cookies))
 			for _, cookie := range fsResp.Solution.Cookies {
-				httpCookie := &http.Cookie{Name: cookie.Name, Value: cookie.Value, Path: cookie.Path}
+				httpCookie := &http.Cookie{Name: cookie.Name, Value: cookie.Value, Path: cookie.Path, Domain: cookie.Domain, Secure: cookie.Secure, HttpOnly: cookie.HttpOnly}
 				if cookie.Expires > 0 {
 					httpCookie.Expires = time.Unix(int64(cookie.Expires), 0)
 				}
@@ -170,16 +197,19 @@ func (fs *FlareSolverr) CheckHealthContext(ctx context.Context) error {
 	if fs == nil || fs.url == "" {
 		return fmt.Errorf("FlareSolverr not configured")
 	}
+	ctx, cancel := context.WithTimeout(ctx, config.HealthTimeout)
+	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fs.url+"/health", nil)
 	if err != nil {
 		return fmt.Errorf("failed to create FlareSolverr health request: %w", err)
 	}
-	resp, err := fs.client.Do(req)
+	resp, err := flareHealthClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to reach FlareSolverr: %w", err)
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("FlareSolverr health check failed with status: %d", resp.StatusCode)

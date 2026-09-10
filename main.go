@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	handler "github.com/yafyx/baak-api/api"
 	"github.com/yafyx/baak-api/config"
@@ -11,12 +17,43 @@ import (
 
 func main() {
 	config.LoadConfig()
+	if err := config.AppConfig.Validate(); err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
 
-	// Start server (only runs locally, not on Vercel)
 	port := config.AppConfig.Port
 	fmt.Printf("Server starting on port %s...\n", port)
-	if err := http.ListenAndServe(port, http.HandlerFunc(Handler)); err != nil {
-		log.Fatal(err)
+	server := &http.Server{
+		Addr:              port,
+		Handler:           http.HandlerFunc(Handler),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      config.RequestTimeout + 5*time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	listener, err := net.Listen("tcp", port)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", port, err)
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server stopped: %v", err)
+		}
+	case <-stop:
+		ctx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+			_ = server.Close()
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -16,15 +17,25 @@ type ComponentStatus struct {
 
 // HealthResponse represents the health check response
 type HealthResponse struct {
-	Status       string                     `json:"status"`
-	Timestamp    time.Time                  `json:"timestamp"`
-	Version      string                     `json:"version"`
-	Components   map[string]ComponentStatus `json:"components"`
-	Cache        *utils.CacheStats          `json:"cache,omitempty"`
+	Status         string                     `json:"status"`
+	Timestamp      time.Time                  `json:"timestamp"`
+	Version        string                     `json:"version"`
+	Components     map[string]ComponentStatus `json:"components"`
+	Cache          *utils.CacheStats          `json:"cache,omitempty"`
 	CircuitBreaker *utils.CircuitBreakerStats `json:"circuit_breaker,omitempty"`
 }
 
+func HandlerLive(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	utils.WriteJSONResponse(w, map[string]string{"status": "alive"})
+}
+
 func HandlerHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet {
 		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
@@ -33,17 +44,21 @@ func HandlerHealth(w http.ResponseWriter, r *http.Request) {
 	components := make(map[string]ComponentStatus)
 	overallStatus := "healthy"
 
-	// Check BAAK reachability (non-blocking quick check)
+	// The circuit state is a local readiness signal; probing BAAK here would
+	// make health checks expensive and could amplify an upstream outage.
 	baakStatus := ComponentStatus{Status: "unknown", Message: "Not checked"}
-	
+
 	// Check FlareSolverr if configured
 	fs := utils.GetFlareSolverr()
 	if fs != nil && fs.IsConfigured() {
-		if err := fs.CheckHealthContext(r.Context()); err != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), config.HealthTimeout)
+		defer cancel()
+		if err := fs.CheckHealthContext(ctx); err != nil {
 			components["flaresolverr"] = ComponentStatus{
 				Status:  "unhealthy",
-				Message: err.Error(),
+				Message: "FlareSolverr health check failed",
 			}
+			overallStatus = "degraded"
 		} else {
 			components["flaresolverr"] = ComponentStatus{
 				Status:  "healthy",
@@ -60,16 +75,21 @@ func HandlerHealth(w http.ResponseWriter, r *http.Request) {
 	// Check circuit breaker state
 	cb := utils.GetCircuitBreaker()
 	cbStats := cb.Stats()
-	if cbStats.State == "open" {
+	if !cbStats.AcceptingRequests {
 		baakStatus = ComponentStatus{
 			Status:  "degraded",
-			Message: "Circuit breaker is open due to repeated failures",
+			Message: "Circuit breaker is " + cbStats.State,
 		}
 		overallStatus = "degraded"
+	} else if cbStats.State != "closed" {
+		baakStatus = ComponentStatus{
+			Status:  "recovering",
+			Message: "Circuit breaker is ready for a recovery probe",
+		}
 	} else {
 		baakStatus = ComponentStatus{
-			Status:  "operational",
-			Message: "Circuit breaker is closed",
+			Status:  "unknown",
+			Message: "Circuit breaker is closed; upstream data availability is not probed",
 		}
 	}
 	components["baak"] = baakStatus
@@ -91,6 +111,9 @@ func HandlerHealth(w http.ResponseWriter, r *http.Request) {
 		CircuitBreaker: &cbStats,
 	}
 
-	utils.WriteJSONResponse(w, response)
+	statusCode := http.StatusOK
+	if overallStatus != "healthy" {
+		statusCode = http.StatusServiceUnavailable
+	}
+	utils.WriteJSONResponseWithStatus(w, statusCode, response)
 }
-

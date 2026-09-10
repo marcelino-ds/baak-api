@@ -40,6 +40,13 @@ Mengembalikan status kesehatan API dengan detail komponen:
 - Status circuit breaker
 - Statistik cache
 
+`/health` adalah readiness probe dan dapat mengembalikan HTTP 503 saat
+FlareSolverr tidak sehat atau circuit breaker sedang menolak request. Setelah
+masa tunggu circuit berakhir, readiness mengizinkan trafik kembali agar probe
+pemulihan dapat berjalan. Field `circuit_breaker.accepting_requests` menunjukkan
+kesiapan menerima request. Gunakan `/live` sebagai liveness probe yang tidak
+bergantung pada BAAK atau FlareSolverr, dan `/ready` sebagai alias readiness.
+
 ### Jadwal Kuliah
 
 ```
@@ -88,14 +95,14 @@ Parameter:
 ### Informasi Mahasiswa Baru
 
 ```
-GET /mahasiswabaru/{npm}
+GET /mahasiswabaru/{kelas_atau_nama}
 ```
 
 Mendapatkan informasi untuk mahasiswa baru.
 
 Parameter:
 
-- `npm` (path parameter): Nomor Pokok Mahasiswa
+- `kelas_atau_nama` (path parameter): Kode kelas atau nama mahasiswa
 
 ## Format Response
 
@@ -166,6 +173,8 @@ API bisa dikonfigurasi menggunakan environment variables:
 | `CACHE_TTL_JADWAL` | `300` | TTL cache jadwal dalam detik |
 | `CACHE_TTL_KALENDER` | `3600` | TTL cache kalender dalam detik |
 | `CACHE_ENABLED` | `true` | Enable/disable caching |
+| `CACHE_MAX_ENTRIES` | `1024` | Batas jumlah entry cache dalam memori |
+| `HTTP_PROXIES` | - | URL proxy HTTP/HTTPS dipisahkan koma |
 
 ### CORS Lokal
 
@@ -296,6 +305,18 @@ go vet ./...
 
 Test otomatis menggunakan server HTTP dan HTML fixture lokal, sehingga tidak
 memerlukan FlareSolverr atau akses jaringan ke BAAK.
+
+Untuk memeriksa akses memori bersama dengan race detector di Linux:
+
+```bash
+docker build --target test -t baak-api:test .
+```
+
+CI menjalankan race detector, vet, build, serta smoke test API dan FlareSolverr
+dalam image produksi. Request memiliki batas waktu 50 detik, pagination dibatasi
+100 halaman, dan cache memiliki batas jumlah entri. Circuit breaker BAAK dan
+FlareSolverr menyimpan kegagalan lintas request dan hanya mengizinkan satu probe
+pemulihan pada satu waktu.
 
 ## Architecture
 

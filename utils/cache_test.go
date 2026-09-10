@@ -100,3 +100,41 @@ func TestCachePanicDoesNotBlockFutureLoads(t *testing.T) {
 		t.Fatalf("load after panic = %v, %v", value, err)
 	}
 }
+
+func TestCacheEvictsEntryNearestExpirationAtCapacity(t *testing.T) {
+	cache := &Cache{items: make(map[string]CacheItem), maxEntries: 2}
+	cache.Set("short", "short", time.Second)
+	cache.Set("long", "long", time.Minute)
+	cache.Set("new", "new", time.Minute)
+	if _, ok := cache.Get("short"); ok {
+		t.Fatal("cache retained the entry nearest expiration")
+	}
+	if _, ok := cache.Get("long"); !ok {
+		t.Fatal("cache evicted a valid long-lived entry")
+	}
+}
+
+func TestCacheWaiterRetriesCanceledLeader(t *testing.T) {
+	cache := &Cache{}
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	started, finished := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, _ = cache.GetOrLoad(leaderCtx, "key", time.Minute, func(ctx context.Context) (interface{}, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	timer := time.AfterFunc(20*time.Millisecond, cancelLeader)
+	defer timer.Stop()
+	value, err := cache.GetOrLoad(ctx, "key", time.Minute, func(context.Context) (interface{}, error) { return "replacement", nil })
+	<-finished
+	if err != nil || value != "replacement" {
+		t.Fatalf("waiter inherited leader cancellation: %v, %v", value, err)
+	}
+}

@@ -18,13 +18,11 @@ func HandlerJadwal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	search := strings.TrimPrefix(r.URL.Path, "/jadwal/")
-	if search == "" {
-		utils.WriteValidationError(w, "Missing kelas in URL")
+	search, err := pathSearch(r.URL.Path, "/jadwal/")
+	if err != nil {
+		utils.WriteValidationError(w, err.Error())
 		return
 	}
-
-	// Validate input
 	if len(search) < 3 {
 		utils.WriteValidationError(w, "Kelas must be at least 3 characters long")
 		return
@@ -52,13 +50,11 @@ func HandlerJadwalSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	search := r.URL.Query().Get("q")
-	if search == "" {
-		utils.WriteValidationError(w, "Missing search query parameter 'q'")
+	search, err := querySearch(r.URL.Query().Get("q"))
+	if err != nil {
+		utils.WriteValidationError(w, err.Error())
 		return
 	}
-
-	// Validate input
 	if len(search) < 3 {
 		utils.WriteValidationError(w, "Search query must be at least 3 characters long")
 		return

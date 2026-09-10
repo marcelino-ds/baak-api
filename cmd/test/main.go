@@ -6,10 +6,12 @@ import (
 	"os"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/yafyx/baak-api/config"
 	"github.com/yafyx/baak-api/utils"
 )
 
 func main() {
+	config.LoadConfig()
 	fmt.Println("Testing session establishment...")
 	scraper, err := utils.NewScraper(utils.BaseURL)
 	if err != nil {

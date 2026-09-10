@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/yafyx/baak-api/config"
 )
 
 // CacheItem represents a cached item with expiration
@@ -15,15 +17,17 @@ type CacheItem struct {
 
 // Cache is a simple in-memory cache with TTL
 type Cache struct {
-	items   map[string]CacheItem
-	loading map[string]*cacheLoad
-	mutex   sync.RWMutex
+	items      map[string]CacheItem
+	loading    map[string]*cacheLoad
+	mutex      sync.RWMutex
+	maxEntries int
 }
 
 type cacheLoad struct {
-	done  chan struct{}
-	value interface{}
-	err   error
+	done     chan struct{}
+	value    interface{}
+	err      error
+	canceled bool
 }
 
 var (
@@ -35,7 +39,8 @@ var (
 func GetCache() *Cache {
 	cacheOnce.Do(func() {
 		globalCache = &Cache{
-			items: make(map[string]CacheItem),
+			items:      make(map[string]CacheItem),
+			maxEntries: config.AppConfig.CacheMaxEntries,
 		}
 		// Start cleanup goroutine
 		go globalCache.cleanup()
@@ -47,6 +52,28 @@ func GetCache() *Cache {
 func (c *Cache) Set(key string, value interface{}, ttl time.Duration) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	if ttl <= 0 {
+		delete(c.items, key)
+		return
+	}
+	if c.items == nil {
+		c.items = make(map[string]CacheItem)
+	}
+	limit := c.maxEntries
+	if limit <= 0 {
+		limit = 1024
+	}
+	if _, exists := c.items[key]; !exists && len(c.items) >= limit {
+		// Evict the entry nearest expiration, including already expired entries.
+		var oldestKey string
+		var oldest time.Time
+		for candidate, item := range c.items {
+			if oldest.IsZero() || item.Expiration.Before(oldest) {
+				oldestKey, oldest = candidate, item.Expiration
+			}
+		}
+		delete(c.items, oldestKey)
+	}
 	c.items[key] = CacheItem{
 		Value:      value,
 		Expiration: time.Now().Add(ttl),
@@ -78,58 +105,75 @@ func (c *Cache) GetOrLoad(
 	ttl time.Duration,
 	load func(context.Context) (interface{}, error),
 ) (interface{}, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if ttl <= 0 {
-		return load(ctx)
-	}
-
-	c.mutex.Lock()
-	if item, ok := c.items[key]; ok && time.Now().Before(item.Expiration) {
-		c.mutex.Unlock()
-		return item.Value, nil
-	}
-	if pending, ok := c.loading[key]; ok {
-		c.mutex.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-pending.done:
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return pending.value, pending.err
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-	}
-	if c.loading == nil {
-		c.loading = make(map[string]*cacheLoad)
-	}
-	pending := &cacheLoad{
-		done: make(chan struct{}),
-		err:  errors.New("cache load did not complete"),
-	}
-	c.loading[key] = pending
-	c.mutex.Unlock()
+		if ttl <= 0 {
+			return load(ctx)
+		}
 
-	// Always release waiters, including when the loader panics.
-	defer func() {
 		c.mutex.Lock()
-		delete(c.loading, key)
-		close(pending.done)
+		if item, ok := c.items[key]; ok && time.Now().Before(item.Expiration) {
+			c.mutex.Unlock()
+			return item.Value, nil
+		}
+		if pending, ok := c.loading[key]; ok {
+			c.mutex.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-pending.done:
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				// A canceled leader must not cancel requests that are still waiting.
+				if pending.canceled {
+					continue
+				}
+				return pending.value, pending.err
+			}
+		}
+		if c.loading == nil {
+			c.loading = make(map[string]*cacheLoad)
+		}
+		pending := &cacheLoad{
+			done: make(chan struct{}),
+			err:  errors.New("cache load did not complete"),
+		}
+		c.loading[key] = pending
 		c.mutex.Unlock()
-	}()
-	value, err := load(ctx)
-	if ctx.Err() != nil {
-		err = ctx.Err()
+
+		// Always release waiters, including when the loader panics.
+		defer func() {
+			panicValue := recover()
+			c.mutex.Lock()
+			if panicValue != nil {
+				pending.canceled = true
+			}
+			delete(c.loading, key)
+			close(pending.done)
+			c.mutex.Unlock()
+			if panicValue != nil {
+				panic(panicValue)
+			}
+		}()
+		value, err := load(ctx)
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			pending.canceled = true
+		}
+		if err != nil {
+			pending.err = err
+			return nil, err
+		}
+		c.Set(key, value, ttl)
+		pending.value, pending.err = value, nil
+		return value, nil
 	}
-	if err != nil {
-		pending.err = err
-		return nil, err
-	}
-	c.Set(key, value, ttl)
-	pending.value, pending.err = value, nil
-	return value, nil
 }
 
 // Delete removes a value from the cache

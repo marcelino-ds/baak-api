@@ -16,9 +16,9 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 		utils.WriteErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	searchTerm := strings.TrimPrefix(r.URL.Path, "/kelasbaru/")
-	if searchTerm == "" {
-		utils.WriteValidationError(w, "Missing search term in URL")
+	searchTerm, validationErr := pathSearch(r.URL.Path, "/kelasbaru/")
+	if validationErr != nil {
+		utils.WriteValidationError(w, validationErr.Error())
 		return
 	}
 	scraper, err := utils.NewScraper(config.AppConfig.BaseURL)
@@ -29,10 +29,11 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 
 	searchTypes := []string{"Kelas", "NPM", "Nama"}
 	var kelasBaru []models.KelasBaru
-	kelasBaruBaseURL := fmt.Sprintf("%s/cariKelasBaru", config.AppConfig.BaseURL)
+	baseURL := strings.TrimRight(config.AppConfig.BaseURL, "/")
+	kelasBaruBaseURL := fmt.Sprintf("%s/cariKelasBaru", baseURL)
 	token, err := scraper.GetCSRFToken(r.Context(), kelasBaruBaseURL)
 	if err != nil {
-		token, err = scraper.GetCSRFToken(r.Context(), config.AppConfig.BaseURL)
+		token, err = scraper.GetCSRFToken(r.Context(), baseURL)
 		if err != nil {
 			utils.WriteHTTPError(w, err)
 			return
@@ -41,7 +42,7 @@ func HandlerKelasbaru(w http.ResponseWriter, r *http.Request) {
 
 	for _, searchType := range searchTypes {
 		searchURL := fmt.Sprintf("%s/cariKelasBaru?_token=%s&tipeKelasBaru=%s&teks=%s",
-			config.AppConfig.BaseURL,
+			baseURL,
 			url.QueryEscape(token),
 			url.QueryEscape(searchType),
 			url.QueryEscape(searchTerm),

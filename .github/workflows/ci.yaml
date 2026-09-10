@@ -1,0 +1,32 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race -count=1 -cover ./...
+      - run: go vet ./...
+      - run: go build ./...
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t baak-api:ci .
+      - name: Check API and FlareSolverr readiness
+        run: |
+          docker run -d --name baak-api-ci -p 127.0.0.1:18080:8080 baak-api:ci
+          trap 'docker logs baak-api-ci; docker stop -t 60 baak-api-ci; docker rm baak-api-ci' EXIT
+          curl --fail --retry 20 --retry-delay 2 --retry-all-errors --max-time 5 http://127.0.0.1:18080/ready
+          curl --fail --max-time 5 http://127.0.0.1:18080/live

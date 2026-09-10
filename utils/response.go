@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -16,30 +17,44 @@ type Response struct {
 }
 
 func WriteJSONResponse(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(Response{
-		Success: true,
+	WriteJSONResponseWithStatus(w, http.StatusOK, data)
+}
+
+func WriteJSONResponseWithStatus(w http.ResponseWriter, status int, data interface{}) {
+	writeResponse(w, status, Response{
+		Success: status < 400,
 		Data:    data,
 	})
 }
 
 func WriteErrorResponse(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{
-		Success: false,
-		Error:   message,
-	})
+	code := "INTERNAL_ERROR"
+	if status == http.StatusMethodNotAllowed {
+		w.Header().Set("Allow", "GET, OPTIONS")
+		code = "METHOD_NOT_ALLOWED"
+	}
+	WriteErrorResponseWithCode(w, status, message, code)
 }
 
 func WriteErrorResponseWithCode(w http.ResponseWriter, status int, message string, code string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{
+	writeResponse(w, status, Response{
 		Success: false,
 		Error:   message,
 		Code:    code,
 	})
+}
+
+func writeResponse(w http.ResponseWriter, status int, response Response) {
+	body, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("JSON response encoding failed: %v", err)
+		status = http.StatusInternalServerError
+		body = []byte(`{"success":false,"error":"Internal server error","code":"INTERNAL_ERROR"}`)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	_, _ = w.Write(append(body, '\n'))
 }
 
 func WriteValidationError(w http.ResponseWriter, message string) {
@@ -54,7 +69,15 @@ func WriteInternalServerError(w http.ResponseWriter) {
 	WriteErrorResponseWithCode(w, http.StatusInternalServerError, "Internal server error", "INTERNAL_ERROR")
 }
 
+func WriteConfigurationError(w http.ResponseWriter) {
+	WriteErrorResponseWithCode(w, http.StatusInternalServerError, "The API configuration is invalid.", "CONFIGURATION_ERROR")
+}
+
 func WriteHTTPError(w http.ResponseWriter, err error) {
+	if err == nil {
+		WriteInternalServerError(w)
+		return
+	}
 	message := err.Error()
 	if errors.Is(err, context.DeadlineExceeded) {
 		WriteErrorResponseWithCode(w, http.StatusGatewayTimeout, "The backend server took too long to respond.", "UPSTREAM_TIMEOUT")
@@ -62,6 +85,34 @@ func WriteHTTPError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, context.Canceled) {
 		WriteErrorResponseWithCode(w, http.StatusRequestTimeout, "The request was canceled before the backend response was ready.", "REQUEST_CANCELED")
+		return
+	}
+	var upstreamStatus upstreamStatusError
+	switch {
+	case errors.Is(err, ErrCircuitOpen):
+		w.Header().Set("Retry-After", "30")
+		WriteErrorResponseWithCode(w, http.StatusServiceUnavailable, "Service temporarily unavailable while the upstream recovers.", "CIRCUIT_OPEN")
+		return
+	case errors.Is(err, ErrCloudflareBlocked):
+		WriteErrorResponseWithCode(w, http.StatusServiceUnavailable, "The BAAK website returned a Cloudflare challenge.", "CLOUDFLARE_BLOCKED")
+		return
+	case errors.As(err, &upstreamStatus):
+		switch upstreamStatus.code {
+		case http.StatusForbidden:
+			WriteErrorResponseWithCode(w, http.StatusServiceUnavailable, "The BAAK website rejected the request.", "CLOUDFLARE_BLOCKED")
+		case http.StatusTooManyRequests:
+			WriteErrorResponseWithCode(w, http.StatusTooManyRequests, "The backend server is rate limiting requests.", "RATE_LIMITED")
+		case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+			WriteErrorResponseWithCode(w, http.StatusGatewayTimeout, "The backend server timed out.", "UPSTREAM_TIMEOUT")
+		default:
+			WriteErrorResponseWithCode(w, http.StatusBadGateway, "The backend server returned an unsuccessful response.", "UPSTREAM_ERROR")
+		}
+		return
+	case errors.Is(err, ErrFlareSolverr):
+		WriteErrorResponseWithCode(w, http.StatusBadGateway, "FlareSolverr could not complete the request.", "FLARESOLVERR_ERROR")
+		return
+	case errors.Is(err, ErrUpstream), errors.Is(err, ErrUnexpectedPage):
+		WriteErrorResponseWithCode(w, http.StatusBadGateway, "The backend server did not return usable data.", "UPSTREAM_ERROR")
 		return
 	}
 

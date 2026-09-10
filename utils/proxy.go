@@ -3,14 +3,14 @@ package utils
 import (
 	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/yafyx/baak-api/config"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -19,9 +19,9 @@ var httpTimeout = 15 * time.Second
 
 // ProxyManager handles proxy rotation for HTTP requests
 type ProxyManager struct {
-	proxies   []*url.URL
-	mutex     sync.RWMutex
-	lastIndex int
+	proxies    []*url.URL
+	mutex      sync.RWMutex
+	transports map[string]*http.Transport
 }
 
 var (
@@ -33,17 +33,13 @@ var (
 func GetProxyManager() *ProxyManager {
 	proxyOnce.Do(func() {
 		globalProxyManager = &ProxyManager{
-			proxies:   make([]*url.URL, 0),
-			lastIndex: -1,
+			proxies: make([]*url.URL, 0),
 		}
 
 		// Load proxies from environment variable if available
-		if proxyList := os.Getenv("HTTP_PROXIES"); proxyList != "" {
-			proxyStrs := strings.Split(proxyList, ",")
-			for _, p := range proxyStrs {
-				if proxyURL, err := url.Parse(strings.TrimSpace(p)); err == nil {
-					globalProxyManager.AddProxy(proxyURL)
-				}
+		for _, p := range config.AppConfig.HTTPProxies {
+			if proxyURL, err := url.Parse(p); err == nil {
+				globalProxyManager.AddProxy(proxyURL)
 			}
 		}
 	})
@@ -71,31 +67,40 @@ func (pm *ProxyManager) AddProxy(proxy *url.URL) {
 
 // GetTransport returns an http.Transport with the next proxy
 func (pm *ProxyManager) GetTransport() *http.Transport {
-	pm.mutex.RLock()
-	defer pm.mutex.RUnlock()
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
 
 	// If no proxies, return default transport
 	if len(pm.proxies) == 0 {
-		return &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			MaxConnsPerHost:     20,
-			IdleConnTimeout:     20 * time.Second,
-			DisableCompression:  false,
-		}
+		return directTransport
 	}
 
 	// Use a random proxy
 	proxyIndex := rand.Intn(len(pm.proxies))
 	proxy := pm.proxies[proxyIndex]
 
+	if pm.transports == nil {
+		pm.transports = make(map[string]*http.Transport)
+	}
+	key := proxy.String()
+	if transport := pm.transports[key]; transport != nil {
+		return transport
+	}
+	transport := newTransport()
+	transport.Proxy = http.ProxyURL(proxy)
+	pm.transports[key] = transport
+	return transport
+}
+
+var directTransport = newTransport()
+
+// Connection pools are shared across requests; clients keep separate cookie jars.
+func newTransport() *http.Transport {
 	return &http.Transport{
-		Proxy:               http.ProxyURL(proxy),
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		MaxConnsPerHost:     20,
-		IdleConnTimeout:     20 * time.Second,
-		DisableCompression:  false,
+		DialContext:  (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns: 100, MaxIdleConnsPerHost: 10, MaxConnsPerHost: 20,
+		IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: httpTimeout, ForceAttemptHTTP2: true,
 	}
 }
 

@@ -19,6 +19,6 @@ services:
         value: "300"
       - key: CACHE_TTL_KALENDER
         value: "3600"
-    healthCheckPath: /health
+    healthCheckPath: /live
 
 

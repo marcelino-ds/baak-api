@@ -11,9 +11,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/yafyx/baak-api/config"
 	"github.com/yafyx/baak-api/models"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/time/rate"
@@ -28,7 +30,12 @@ var Limiter = rate.NewLimiter(rate.Limit(5), 10)
 
 const maxHTMLBodyBytes int64 = 8 << 20
 
-var ErrUnexpectedPage = errors.New("upstream response has an unexpected page format")
+var (
+	ErrUnexpectedPage    = errors.New("upstream response has an unexpected page format")
+	ErrCloudflareBlocked = errors.New("upstream returned a Cloudflare challenge")
+	ErrFlareSolverr      = errors.New("FlareSolverr request failed")
+	ErrUpstream          = errors.New("upstream request failed")
+)
 
 // Scraper owns the HTTP session for one API request. Keeping the client and
 // cookie jar together makes CSRF and FlareSolverr fallbacks use one session.
@@ -37,32 +44,30 @@ type Scraper struct {
 	client       *http.Client
 	flareSolverr *FlareSolverr
 	breaker      *CircuitBreaker
+	flareBreaker *CircuitBreaker
 	referrer     string
+	mu           sync.Mutex
 }
+
+const maxResultPages = 100
 
 // NewScraper creates a request-scoped scraper with a secure TLS client.
 func NewScraper(baseURL string) (*Scraper, error) {
 	if baseURL == "" {
 		baseURL = BaseURL
 	}
-	parsedURL, err := url.Parse(baseURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-		return nil, fmt.Errorf("invalid BAAK base URL %q", baseURL)
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if err := config.ValidateBaseURL(baseURL); err != nil {
+		return nil, fmt.Errorf("invalid BAAK base URL: %w", err)
 	}
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cookie jar: %w", err)
 	}
 	client := &http.Client{
-		Timeout: httpTimeout,
-		Jar:     jar,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			MaxConnsPerHost:     20,
-			IdleConnTimeout:     30 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
+		Timeout:   httpTimeout,
+		Jar:       jar,
+		Transport: directTransport,
 	}
 	if proxyManager := GetProxyManager(); proxyManager.HasProxies() {
 		proxyClient, err := proxyManager.GetClient()
@@ -72,11 +77,12 @@ func NewScraper(baseURL string) (*Scraper, error) {
 		client = proxyClient
 	}
 	return &Scraper{
-		BaseURL:      strings.TrimRight(baseURL, "/"),
+		BaseURL:      baseURL,
 		client:       client,
 		flareSolverr: GetFlareSolverr(),
 		breaker:      GetCircuitBreaker(),
-		referrer:     strings.TrimRight(baseURL, "/"),
+		flareBreaker: GetFlareCircuitBreaker(),
+		referrer:     baseURL,
 	}, nil
 }
 
@@ -89,6 +95,8 @@ func (e upstreamStatusError) Error() string {
 }
 
 func (s *Scraper) ensureClient() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.client == nil {
 		return errors.New("scraper client is not configured")
 	}
@@ -120,21 +128,22 @@ func (s *Scraper) fetchOnce(ctx context.Context, targetURL, referrer string) (*g
 	req.Header.Set("Referer", referrer)
 	response, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch URL: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrUpstream, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 32<<10))
 		return nil, upstreamStatusError{code: response.StatusCode}
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxHTMLBodyBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read HTML: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrUpstream, err)
 	}
 	if int64(len(body)) > maxHTMLBodyBytes {
-		return nil, errors.New("HTML response exceeds size limit")
+		return nil, fmt.Errorf("%w: HTML response exceeds size limit", ErrUnexpectedPage)
 	}
 	if IsCloudflareChallenge(string(body)) {
-		return nil, errors.New("access forbidden (403): Cloudflare challenge")
+		return nil, ErrCloudflareBlocked
 	}
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
@@ -158,7 +167,9 @@ func (s *Scraper) fetchWithRetry(ctx context.Context, targetURL string, maxRetri
 	if maxRetries < 1 {
 		return nil, errors.New("max retries must be positive")
 	}
+	s.mu.Lock()
 	referrer := s.referrer
+	s.mu.Unlock()
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -166,7 +177,9 @@ func (s *Scraper) fetchWithRetry(ctx context.Context, targetURL string, maxRetri
 		}
 		doc, err := s.fetchOnce(ctx, targetURL, referrer)
 		if err == nil {
+			s.mu.Lock()
 			s.referrer = targetURL
+			s.mu.Unlock()
 			return doc, nil
 		}
 		lastErr = err
@@ -174,7 +187,10 @@ func (s *Scraper) fetchWithRetry(ctx context.Context, targetURL string, maxRetri
 			break
 		}
 		var statusErr upstreamStatusError
-		if errors.As(err, &statusErr) && (statusErr.code == http.StatusForbidden || statusErr.code == http.StatusTooManyRequests) {
+		if errors.As(err, &statusErr) && statusErr.code < 500 && statusErr.code != http.StatusRequestTimeout {
+			break
+		}
+		if errors.Is(err, ErrUnexpectedPage) {
 			break
 		}
 		if attempt+1 < maxRetries {
@@ -191,7 +207,7 @@ func isCloudflareError(err error) bool {
 		return false
 	}
 	var statusErr upstreamStatusError
-	return errors.As(err, &statusErr) && statusErr.code == http.StatusForbidden || strings.Contains(err.Error(), "Cloudflare challenge")
+	return (errors.As(err, &statusErr) && statusErr.code == http.StatusForbidden) || errors.Is(err, ErrCloudflareBlocked)
 }
 
 // FetchDocument fetches HTML, retries transient failures, and falls back to FlareSolverr.
@@ -199,36 +215,48 @@ func (s *Scraper) FetchDocument(ctx context.Context, targetURL string) (*goquery
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if s.breaker == nil {
-		s.breaker = GetCircuitBreaker()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := s.ensureClient(); err != nil {
 		return nil, err
 	}
-	if err := s.breaker.Allow(); err != nil {
-		if s.flareSolverr == nil {
-			return nil, fmt.Errorf("service temporarily unavailable: %w", err)
+	s.mu.Lock()
+	if s.breaker == nil {
+		s.breaker = GetCircuitBreaker()
+	}
+	if s.flareBreaker == nil {
+		s.flareBreaker = GetFlareCircuitBreaker()
+	}
+	breaker := s.breaker
+	flareBreaker := s.flareBreaker
+	s.mu.Unlock()
+	var doc *goquery.Document
+	err := breaker.Execute(func() error {
+		var fetchErr error
+		doc, fetchErr = s.fetchWithRetry(ctx, targetURL, 3)
+		if isCloudflareError(fetchErr) && s.flareSolverr != nil {
+			return flareBreaker.Execute(func() error {
+				doc, fetchErr = s.fetchFlareSolverr(ctx, targetURL)
+				return fetchErr
+			})
 		}
-		return s.fetchFlareSolverr(ctx, targetURL)
+		return fetchErr
+	})
+	if errors.Is(err, ErrCircuitOpen) && s.flareSolverr != nil {
+		var flareErr error
+		err = flareBreaker.Execute(func() error {
+			doc, flareErr = s.fetchFlareSolverr(ctx, targetURL)
+			return flareErr
+		})
 	}
-	doc, err := s.fetchWithRetry(ctx, targetURL, 3)
-	if err == nil {
-		s.breaker.RecordSuccess()
-		return doc, nil
-	}
-	if isCloudflareError(err) && s.flareSolverr != nil {
-		doc, flareErr := s.fetchFlareSolverr(ctx, targetURL)
-		if flareErr == nil {
-			s.breaker.RecordSuccess()
-			return doc, nil
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		err = flareErr
+		return nil, err
 	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	s.breaker.RecordFailure()
-	return nil, err
+	return doc, nil
 }
 
 func (s *Scraper) fetchFlareSolverr(ctx context.Context, targetURL string) (*goquery.Document, error) {
@@ -237,10 +265,10 @@ func (s *Scraper) fetchFlareSolverr(ctx context.Context, targetURL string) (*goq
 	}
 	html, err := s.flareSolverr.FetchContext(ctx, targetURL, s.client.Jar)
 	if err != nil {
-		return nil, fmt.Errorf("FlareSolverr fetch failed: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrFlareSolverr, err)
 	}
 	if IsCloudflareChallenge(html) {
-		return nil, errors.New("FlareSolverr returned a Cloudflare challenge")
+		return nil, ErrCloudflareBlocked
 	}
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
@@ -256,8 +284,8 @@ func (s *Scraper) GetCSRFToken(ctx context.Context, targetURL string) (string, e
 		return "", fmt.Errorf("failed to fetch document for CSRF token: %w", err)
 	}
 	token, exists := doc.Find(`input[name="_token"]`).First().Attr("value")
-	if !exists {
-		return "", fmt.Errorf("CSRF token input field not found on page: %s", targetURL)
+	if !exists || strings.TrimSpace(token) == "" {
+		return "", fmt.Errorf("%w: CSRF token is missing", ErrUnexpectedPage)
 	}
 	return token, nil
 }
@@ -357,7 +385,10 @@ func (s *Scraper) GetKegiatan(ctx context.Context) ([]models.Kegiatan, error) {
 func (s *Scraper) GetKelasbaru(ctx context.Context, targetURL string) ([]models.KelasBaru, error) {
 	items := make([]models.KelasBaru, 0)
 	for page := 1; ; page++ {
-		doc, err := s.FetchDocument(ctx, fmt.Sprintf("%s&page=%d", targetURL, page))
+		if page > maxResultPages {
+			return nil, fmt.Errorf("%w: class result pagination exceeded %d pages", ErrUnexpectedPage, maxResultPages)
+		}
+		doc, err := s.FetchDocument(ctx, pageURL(targetURL, page))
 		if err != nil {
 			return nil, err
 		}
@@ -380,7 +411,10 @@ func (s *Scraper) GetKelasbaru(ctx context.Context, targetURL string) ([]models.
 func (s *Scraper) GetMahasiswaBaru(ctx context.Context, targetURL string) ([]models.MahasiswaBaru, error) {
 	items := make([]models.MahasiswaBaru, 0)
 	for page := 1; ; page++ {
-		doc, err := s.FetchDocument(ctx, fmt.Sprintf("%s&page=%d", targetURL, page))
+		if page > maxResultPages {
+			return nil, fmt.Errorf("%w: student result pagination exceeded %d pages", ErrUnexpectedPage, maxResultPages)
+		}
+		doc, err := s.FetchDocument(ctx, pageURL(targetURL, page))
 		if err != nil {
 			return nil, err
 		}
@@ -398,6 +432,17 @@ func (s *Scraper) GetMahasiswaBaru(ctx context.Context, targetURL string) ([]mod
 			return items, nil
 		}
 	}
+}
+
+func pageURL(targetURL string, page int) string {
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return fmt.Sprintf("%s&page=%d", targetURL, page)
+	}
+	query := u.Query()
+	query.Set("page", strconv.Itoa(page))
+	u.RawQuery = query.Encode()
+	return u.String()
 }
 
 func hasEmptySearchResult(doc *goquery.Document) bool {
@@ -449,6 +494,9 @@ func convertWaktuToJam(waktu string, timeStampLUT [][]string) string {
 		return ""
 	}
 	if start > end {
+		return ""
+	}
+	if len(timeStampLUT[start-1]) < 2 || len(timeStampLUT[end-1]) < 2 {
 		return ""
 	}
 
